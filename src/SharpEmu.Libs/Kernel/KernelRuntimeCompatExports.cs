@@ -258,6 +258,8 @@ public static class KernelRuntimeCompatExports
             }
         }
 
+        TraceProcParam(ctx, address);
+
         ctx[CpuRegister.Rax] = address;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -267,6 +269,223 @@ public static class KernelRuntimeCompatExports
         lock (_stateGate)
         {
             _processProcParamAddress = procParamAddress;
+        }
+    }
+
+    private static void TraceProcParam(CpuContext ctx, ulong address)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PROC_PARAM"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (address == 0)
+        {
+            Console.Error.WriteLine("[LOADER][TRACE] proc_param: address=0");
+            return;
+        }
+
+        const int dumpSize = 0x200;
+        var buffer = GC.AllocateUninitializedArray<byte>(dumpSize);
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] proc_param: address=0x{address:X16} unreadable");
+            return;
+        }
+
+        Console.Error.WriteLine($"[LOADER][TRACE] proc_param: address=0x{address:X16} size=0x{dumpSize:X}");
+        for (var offset = 0; offset < dumpSize; offset += 16)
+        {
+            var slice = buffer.AsSpan(offset, 16);
+            var hex = Convert.ToHexString(slice);
+            Console.Error.WriteLine($"[LOADER][TRACE] proc_param[{offset:X3}]: {hex}");
+        }
+
+        TraceProcParamPointers(ctx, address, buffer);
+    }
+
+    private static void TraceProcParamPointers(CpuContext ctx, ulong baseAddress, ReadOnlySpan<byte> buffer)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PROC_PARAM_PTRS"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (buffer.Length < 0x50)
+        {
+            return;
+        }
+
+        for (var offset = 0x20; offset <= 0x48; offset += 8)
+        {
+            var ptr = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Slice(offset, 8));
+            Console.Error.WriteLine($"[LOADER][TRACE] proc_param.ptr@{offset:X2}: 0x{ptr:X16}");
+            if (ptr == 0)
+            {
+                continue;
+            }
+
+            TraceProcParamPointerTarget(ctx, ptr);
+        }
+    }
+
+    private static void TraceProcParamPointerTarget(CpuContext ctx, ulong address)
+    {
+        const int maxAsciiBytes = 256;
+        const int maxWideChars = 128;
+
+        if (TryReadUtf8CString(ctx, address, maxAsciiBytes, out var asciiValue))
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] proc_param.ptr.target ascii@0x{address:X16}: \"{asciiValue}\"");
+            return;
+        }
+
+        if (TryReadUtf16CString(ctx, address, maxWideChars, out var wideValue))
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] proc_param.ptr.target wide@0x{address:X16}: \"{wideValue}\"");
+            return;
+        }
+
+        var preview = GC.AllocateUninitializedArray<byte>(64);
+        if (ctx.Memory.TryRead(address, preview))
+        {
+            var hex = Convert.ToHexString(preview);
+            Console.Error.WriteLine($"[LOADER][TRACE] proc_param.ptr.target hex@0x{address:X16}: {hex}");
+            TraceProcParamEmbeddedPointers(ctx, address, preview);
+        }
+        else
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] proc_param.ptr.target unreadable@0x{address:X16}");
+        }
+    }
+
+    private static bool TryReadUtf8CString(CpuContext ctx, ulong address, int maxBytes, out string value)
+    {
+        value = string.Empty;
+        var buffer = GC.AllocateUninitializedArray<byte>(maxBytes);
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            return false;
+        }
+
+        var length = Array.IndexOf(buffer, (byte)0);
+        if (length < 0)
+        {
+            length = maxBytes;
+        }
+
+        if (length == 0)
+        {
+            return false;
+        }
+
+        var text = Encoding.UTF8.GetString(buffer, 0, length);
+        if (!IsMostlyPrintable(text))
+        {
+            return false;
+        }
+
+        value = text;
+        return true;
+    }
+
+    private static bool TryReadUtf16CString(CpuContext ctx, ulong address, int maxChars, out string value)
+    {
+        value = string.Empty;
+        var maxBytes = maxChars * 2;
+        var buffer = GC.AllocateUninitializedArray<byte>(maxBytes);
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            return false;
+        }
+
+        var lengthBytes = -1;
+        for (var i = 0; i + 1 < buffer.Length; i += 2)
+        {
+            if (buffer[i] == 0 && buffer[i + 1] == 0)
+            {
+                lengthBytes = i;
+                break;
+            }
+        }
+
+        if (lengthBytes <= 0)
+        {
+            return false;
+        }
+
+        var text = Encoding.Unicode.GetString(buffer, 0, lengthBytes);
+        if (!IsMostlyPrintable(text))
+        {
+            return false;
+        }
+
+        value = text;
+        return true;
+    }
+
+    private static bool IsMostlyPrintable(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var printable = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '\0')
+            {
+                continue;
+            }
+
+            if (!char.IsControl(ch) || ch == '\r' || ch == '\n' || ch == '\t')
+            {
+                printable++;
+            }
+        }
+
+        return printable >= Math.Max(4, text.Length * 3 / 4);
+    }
+
+    private static void TraceProcParamEmbeddedPointers(CpuContext ctx, ulong baseAddress, ReadOnlySpan<byte> data)
+    {
+        const int maxCandidates = 12;
+        var found = 0;
+        Span<byte> probe = stackalloc byte[2];
+
+        for (var offset = 0; offset + 8 <= data.Length; offset += 8)
+        {
+            var candidate = BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(offset, 8));
+            if (candidate == 0)
+            {
+                continue;
+            }
+
+            if (!ctx.Memory.TryRead(candidate, probe))
+            {
+                continue;
+            }
+
+            if (TryReadUtf8CString(ctx, candidate, 256, out var ascii))
+            {
+                Console.Error.WriteLine($"[LOADER][TRACE] proc_param.ptr.embed@0x{baseAddress:X16}+0x{offset:X2} -> 0x{candidate:X16} ascii \"{ascii}\"");
+                if (++found >= maxCandidates)
+                {
+                    return;
+                }
+                continue;
+            }
+
+            if (TryReadUtf16CString(ctx, candidate, 128, out var wide))
+            {
+                Console.Error.WriteLine($"[LOADER][TRACE] proc_param.ptr.embed@0x{baseAddress:X16}+0x{offset:X2} -> 0x{candidate:X16} wide \"{wide}\"");
+                if (++found >= maxCandidates)
+                {
+                    return;
+                }
+            }
         }
     }
 

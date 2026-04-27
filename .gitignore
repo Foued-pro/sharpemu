@@ -29,6 +29,8 @@ arm64/
 packages/
 *.nupkg
 .nuget/
+.dotnet-home/
+.cache/
 
 .DS_Store
 Thumbs.db

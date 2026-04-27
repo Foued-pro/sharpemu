@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
+using SharpEmu.Libs.Ampr;
 using System.Buffers.Binary;
 using System.Text;
 using System.Threading;
@@ -101,6 +102,7 @@ public static class KernelMemoryCompatExports
     private static int _inaccessibleMemsetRecoveryCount;
     private static int _hostMemoryWriteFallbackCount;
     private static int _hostMemoryReadFallbackCount;
+    private static int _nullWcscpyRecoveryCount;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MemoryBasicInformation
@@ -364,6 +366,24 @@ public static class KernelMemoryCompatExports
 
     private static int WcscpyCore(CpuContext ctx, ulong destination, ulong source)
     {
+        if (source == 0)
+        {
+            var recoveryIndex = Interlocked.Increment(ref _nullWcscpyRecoveryCount);
+            if (recoveryIndex <= 8)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][WARNING] wcscpy null-src recovery#{recoveryIndex}: rip=0x{ctx.Rip:X16} dst=0x{destination:X16}");
+            }
+
+            if (!TryWriteWideTerminator(ctx, destination))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            ctx[CpuRegister.Rax] = destination;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
         if (!TryReadWideCString(ctx, source, 1_048_576, out var units))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -1281,8 +1301,10 @@ public static class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
+            var fileId = AmprFileRegistry.Register(guestPath, hostPath);
+
             if (idsAddress != 0 &&
-                !TryWriteUInt32Compat(ctx, idsAddress + (i * sizeof(uint)), ComputeDirectoryEntryHash(Encoding.UTF8.GetBytes(guestPath))))
+                !TryWriteUInt32Compat(ctx, idsAddress + (i * sizeof(uint)), fileId))
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
             }
