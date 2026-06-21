@@ -7,13 +7,17 @@ using SharpEmu.HLE;
 
 namespace SharpEmu.Core.Memory;
 
-public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IDisposable
+public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryAllocator, IDisposable
 {
     private readonly object _gate = new();
+    private readonly object _guestAllocationGate = new();
     private readonly List<MemoryRegion> _regions = new();
     private readonly Dictionary<ulong, ProgramHeaderFlags> _pageProtections = new();
     private bool _disposed;
     private const ulong PageSize = 0x1000;
+    private const ulong GuestAllocationArenaAddress = 0x00006000_0000_0000;
+    private const ulong GuestAllocationArenaSize = 0x0100_0000;
+    private const ulong GuestAllocationArenaStartOffset = PageSize;
     private const ulong LargeDataReserveThreshold = 0x4000_0000UL; // 1 GiB
     private const ulong LazyReservePrimeBytes = 0x5000_0000UL; // 1.25 GiB
     private const ulong LazyReservePrimeChunkBytes = 0x0200_0000UL; // 32 MiB
@@ -28,6 +32,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IDisposable
     private const uint PAGE_NOACCESS = 0x01;
     private const uint PAGE_READWRITE = 0x04;
     private const uint PAGE_READONLY = 0x02;
+
+    private ulong _guestAllocationArenaBase;
+    private ulong _guestAllocationOffset;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern void* VirtualAlloc(void* lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
@@ -215,16 +222,61 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IDisposable
         return actualAddress;
     }
 
+    public bool TryAllocateGuestMemory(ulong size, ulong alignment, out ulong address)
+    {
+        address = 0;
+        if (size == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0)
+        {
+            return false;
+        }
+
+        lock (_guestAllocationGate)
+        {
+            if (_guestAllocationArenaBase == 0)
+            {
+                try
+                {
+                    _guestAllocationArenaBase = AllocateAt(
+                        GuestAllocationArenaAddress,
+                        GuestAllocationArenaSize,
+                        executable: false,
+                        allowAlternative: true);
+                    _guestAllocationOffset = GuestAllocationArenaStartOffset;
+                }
+                catch (Exception)
+                {
+                    return false;
+                }
+            }
+
+            var alignedOffset = AlignUp(_guestAllocationOffset, alignment);
+            if (alignedOffset > GuestAllocationArenaSize || size > GuestAllocationArenaSize - alignedOffset)
+            {
+                return false;
+            }
+
+            address = _guestAllocationArenaBase + alignedOffset;
+            _guestAllocationOffset = alignedOffset + size;
+            return true;
+        }
+    }
+
     public void Clear()
     {
-        lock (_gate)
+        lock (_guestAllocationGate)
         {
-            foreach (var region in _regions)
+            lock (_gate)
             {
-                VirtualFree((void*)region.VirtualAddress, 0, MEM_RELEASE);
+                foreach (var region in _regions)
+                {
+                    VirtualFree((void*)region.VirtualAddress, 0, MEM_RELEASE);
+                }
+                _regions.Clear();
+                _pageProtections.Clear();
             }
-            _regions.Clear();
-            _pageProtections.Clear();
+
+            _guestAllocationArenaBase = 0;
+            _guestAllocationOffset = 0;
         }
     }
 

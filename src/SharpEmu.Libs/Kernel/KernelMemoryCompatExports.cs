@@ -38,6 +38,13 @@ public static class KernelMemoryCompatExports
     private const int OrbisKernelBatchMapEntryProtectionOffset = 24;
     private const int OrbisKernelBatchMapEntryTypeOffset = 25;
     private const int OrbisKernelBatchMapEntryOperationOffset = 28;
+    private const ulong OrbisPageSize = 0x4000;
+    private const int OrbisProtCpuRead = 0x01;
+    private const int OrbisProtCpuWrite = 0x02;
+    private const int OrbisProtCpuExec = 0x04;
+    private const int OrbisProtGpuRead = 0x10;
+    private const int OrbisProtGpuWrite = 0x20;
+    private const int OrbisProtCpuReadWrite = OrbisProtCpuRead | OrbisProtCpuWrite;
     private const int SeekSet = 0;
     private const int SeekCur = 1;
     private const int SeekEnd = 2;
@@ -47,14 +54,15 @@ public static class KernelMemoryCompatExports
     private const int OrbisVirtualQueryInfoSize = 72;
     private const int OrbisKernelMaximumNameLength = 32;
     private const uint MemCommit = 0x1000;
-    private const uint PageNoAccess = 0x01;
-    private const uint PageReadOnly = 0x02;
-    private const uint PageReadWrite = 0x04;
-    private const uint PageWriteCopy = 0x08;
-    private const uint PageExecuteRead = 0x20;
-    private const uint PageExecuteReadWrite = 0x40;
-    private const uint PageExecuteWriteCopy = 0x80;
-    private const uint PageGuard = 0x100;
+    private const uint HostPageNoAccess = 0x01;
+    private const uint HostPageReadOnly = 0x02;
+    private const uint HostPageReadWrite = 0x04;
+    private const uint HostPageWriteCopy = 0x08;
+    private const uint HostPageExecute = 0x10;
+    private const uint HostPageExecuteRead = 0x20;
+    private const uint HostPageExecuteReadWrite = 0x40;
+    private const uint HostPageExecuteWriteCopy = 0x80;
+    private const uint HostPageGuard = 0x100;
     private const int Enomem = 12;
     private const int Einval = 22;
     private const int Erange = 34;
@@ -121,6 +129,10 @@ public static class KernelMemoryCompatExports
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern nuint VirtualQuery(nint lpAddress, out MemoryBasicInformation lpBuffer, nuint dwLength);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool VirtualProtect(nint lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect);
+
     private sealed class OpenDirectory
     {
         public required string Path { get; init; }
@@ -130,8 +142,58 @@ public static class KernelMemoryCompatExports
 
     private readonly record struct DirectAllocation(ulong Start, ulong Length, int MemoryType);
     private readonly record struct LibcHeapAllocation(nint BaseAddress, nuint Size, nuint Alignment);
-    private readonly record struct MappedRegion(ulong Address, ulong Length, int Protection, bool IsFlexible, ulong DirectStart);
+    private readonly record struct MappedRegion(ulong Address, ulong Length, int Protection, bool IsFlexible, bool IsDirect, ulong DirectStart);
     private readonly record struct BatchMapEntry(ulong Start, ulong Offset, ulong Length, byte Protection, byte Type, int Operation);
+
+    internal static bool TryAllocateHleData(
+        CpuContext ctx,
+        ulong length,
+        ulong alignment,
+        out ulong address)
+    {
+        address = 0;
+        if (length == 0 || length > int.MaxValue)
+        {
+            return false;
+        }
+
+        var mappedLength = AlignUp(length, 0x1000UL);
+        var effectiveAlignment = Math.Max(alignment, 0x1000UL);
+        lock (_memoryGate)
+        {
+            var desiredAddress = AlignUp(
+                _nextVirtualAddress == 0 ? 0x1_0000_0000UL : _nextVirtualAddress,
+                effectiveAlignment);
+            if (!TryReserveGuestVirtualRange(ctx, desiredAddress, mappedLength, OrbisProtCpuReadWrite, out address) ||
+                address == 0)
+            {
+                return false;
+            }
+
+            _nextVirtualAddress = Math.Max(_nextVirtualAddress, address + mappedLength);
+            _mappedRegions[address] = new MappedRegion(
+                address,
+                mappedLength,
+                OrbisProtCpuReadWrite,
+                IsFlexible: false,
+                IsDirect: false,
+                DirectStart: 0);
+        }
+
+        var zeroes = new byte[(int)Math.Min(mappedLength, (ulong)MemsetChunkSize)];
+        for (ulong offset = 0; offset < mappedLength;)
+        {
+            var chunkLength = (int)Math.Min((ulong)zeroes.Length, mappedLength - offset);
+            if (!ctx.Memory.TryWrite(address + offset, zeroes.AsSpan(0, chunkLength)))
+            {
+                return false;
+            }
+
+            offset += (ulong)chunkLength;
+        }
+
+        return true;
+    }
 
     [SysAbiExport(
         Nid = "8zTFvBIAIN8",
@@ -1239,6 +1301,13 @@ public static class KernelMemoryCompatExports
     public static int KernelCloseUnderscore(CpuContext ctx) => KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi]));
 
     [SysAbiExport(
+        Nid = "bY-PO6JhzhQ",
+        ExportName = "close",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixClose(CpuContext ctx) => KernelCloseCore(ctx, unchecked((int)ctx[CpuRegister.Rdi]));
+
+    [SysAbiExport(
         Nid = "UK2Tl2DWUns",
         ExportName = "sceKernelClose",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -1445,6 +1514,20 @@ public static class KernelMemoryCompatExports
     }
 
     [SysAbiExport(
+        Nid = "AqBioC2vF3I",
+        ExportName = "read",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixRead(CpuContext ctx) => KernelReadUnderscore(ctx);
+
+    [SysAbiExport(
+        Nid = "Cg4srZ6TKbU",
+        ExportName = "sceKernelRead",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelRead(CpuContext ctx) => KernelReadUnderscore(ctx);
+
+    [SysAbiExport(
         Nid = "Oy6IpwgtYOk",
         ExportName = "lseek",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -1628,6 +1711,20 @@ public static class KernelMemoryCompatExports
         ctx[CpuRegister.Rax] = unchecked((ulong)requested);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    [SysAbiExport(
+        Nid = "FN4gaPmuFV8",
+        ExportName = "write",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixWrite(CpuContext ctx) => KernelWriteUnderscore(ctx);
+
+    [SysAbiExport(
+        Nid = "4wSze92BhLI",
+        ExportName = "sceKernelWrite",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelWrite(CpuContext ctx) => KernelWriteUnderscore(ctx);
 
     [SysAbiExport(
         Nid = "lLMT9vJAck0",
@@ -2172,7 +2269,13 @@ public static class KernelMemoryCompatExports
             }
 
             _nextVirtualAddress = Math.Max(_nextVirtualAddress, mappedAddress + length);
-            _mappedRegions[mappedAddress] = new MappedRegion(mappedAddress, length, protection, IsFlexible: false, DirectStart: directMemoryStart);
+            _mappedRegions[mappedAddress] = new MappedRegion(
+                mappedAddress,
+                length,
+                protection,
+                IsFlexible: false,
+                IsDirect: true,
+                DirectStart: directMemoryStart);
         }
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
@@ -2245,7 +2348,13 @@ public static class KernelMemoryCompatExports
 
             _nextVirtualAddress = Math.Max(_nextVirtualAddress, mappedAddress + length);
             _allocatedFlexibleBytes = Math.Min(FlexibleMemorySizeBytes, _allocatedFlexibleBytes + length);
-            _mappedRegions[mappedAddress] = new MappedRegion(mappedAddress, length, protection, IsFlexible: true, DirectStart: 0);
+            _mappedRegions[mappedAddress] = new MappedRegion(
+                mappedAddress,
+                length,
+                protection,
+                IsFlexible: true,
+                IsDirect: false,
+                DirectStart: 0);
         }
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
@@ -2344,8 +2453,7 @@ public static class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
-            if (region.DirectStart != 0 &&
-                _directAllocations.TryGetValue(region.DirectStart, out var allocation))
+            if (region.IsDirect && TryFindDirectAllocationLocked(region.DirectStart, out var allocation))
             {
                 memoryType = allocation.MemoryType;
             }
@@ -2363,7 +2471,7 @@ public static class KernelMemoryCompatExports
             stateFlags |= 0x01u;
         }
 
-        if (region.DirectStart != 0)
+        if (region.IsDirect)
         {
             stateFlags |= 0x02u;
         }
@@ -2377,7 +2485,7 @@ public static class KernelMemoryCompatExports
         BinaryPrimitives.WriteInt32LittleEndian(payload[28..32], memoryType);
         payload[32] = unchecked((byte)stateFlags);
 
-        var name = region.DirectStart != 0
+        var name = region.IsDirect
             ? "direct"
             : region.IsFlexible
                 ? "flexible"
@@ -2495,12 +2603,19 @@ public static class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        if (!TryNormalizeProtectRange(address, length, out var alignedAddress, out var alignedLength))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!TryProtectHostRange(alignedAddress, alignedLength, protection))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
         lock (_memoryGate)
         {
-            if (!TryApplyMappedRegionProtectionLocked(address, length, protection))
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
-            }
+            _ = TryApplyMappedRegionProtectionLocked(alignedAddress, alignedLength, protection);
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -2522,12 +2637,19 @@ public static class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        if (!TryNormalizeProtectRange(address, length, out var alignedAddress, out var alignedLength))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (!TryProtectHostRange(alignedAddress, alignedLength, protection))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
         lock (_memoryGate)
         {
-            if (!TryApplyMappedRegionProtectionLocked(address, length, protection, memoryType))
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
-            }
+            _ = TryApplyMappedRegionProtectionLocked(alignedAddress, alignedLength, protection, memoryType);
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -3562,7 +3684,7 @@ public static class KernelMemoryCompatExports
                 return false;
             }
 
-            var executable = (protection & 0x04) != 0;
+            var executable = (protection & OrbisProtCpuExec) != 0;
             var invokeArgs = allocateAtHasAllowAlternativeArg
                 ? new object[] { desiredAddress, length, executable, true }
                 : new object[] { desiredAddress, length, executable };
@@ -3692,6 +3814,25 @@ public static class KernelMemoryCompatExports
             return temp0Root;
         }
 
+        var hostappRoot = ResolveHostappRoot();
+        if (guestPath.StartsWith("/hostapp/", StringComparison.OrdinalIgnoreCase))
+        {
+            var relative = NormalizeMountRelativePath(guestPath["/hostapp/".Length..]);
+            return Path.Combine(hostappRoot, relative);
+        }
+
+        if (guestPath.StartsWith("hostapp/", StringComparison.OrdinalIgnoreCase))
+        {
+            var relative = NormalizeMountRelativePath(guestPath["hostapp/".Length..]);
+            return Path.Combine(hostappRoot, relative);
+        }
+
+        if (string.Equals(guestPath, "/hostapp", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(guestPath, "hostapp", StringComparison.OrdinalIgnoreCase))
+        {
+            return hostappRoot;
+        }
+
         var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
         if (!string.IsNullOrWhiteSpace(app0Root))
         {
@@ -3772,6 +3913,25 @@ public static class KernelMemoryCompatExports
         appName = new string(appName.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray());
         var root = Path.Combine(Path.GetTempPath(), "SharpEmu", appName, "temp0");
         Environment.SetEnvironmentVariable(temp0VariableName, root);
+        return root;
+    }
+
+    private static string ResolveHostappRoot()
+    {
+        const string hostappVariableName = "SHARPEMU_HOSTAPP_DIR";
+        var configuredRoot = Environment.GetEnvironmentVariable(hostappVariableName);
+        string root;
+        if (!string.IsNullOrWhiteSpace(configuredRoot))
+        {
+            root = Path.GetFullPath(configuredRoot);
+        }
+        else
+        {
+            root = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, "logs", "hostapp"));
+            Environment.SetEnvironmentVariable(hostappVariableName, root);
+        }
+
+        Directory.CreateDirectory(root);
         return root;
     }
 
@@ -4336,21 +4496,169 @@ public static class KernelMemoryCompatExports
         int protection,
         int? memoryType = null)
     {
-        if (!_mappedRegions.TryGetValue(address, out var region) || region.Length != length)
+        if (length == 0 || !TryAddU64(address, length, out var endAddress))
         {
             return false;
         }
 
-        _mappedRegions[address] = region with { Protection = protection };
-
-        if (memoryType.HasValue &&
-            region.DirectStart != 0 &&
-            _directAllocations.TryGetValue(region.DirectStart, out var allocation))
+        var affected = new List<MappedRegion>();
+        var cursor = address;
+        foreach (var region in _mappedRegions.Values.OrderBy(static region => region.Address))
         {
-            _directAllocations[region.DirectStart] = allocation with { MemoryType = memoryType.Value };
+            if (!TryAddU64(region.Address, region.Length, out var regionEnd) || regionEnd <= cursor)
+            {
+                continue;
+            }
+
+            if (region.Address > cursor)
+            {
+                return false;
+            }
+
+            affected.Add(region);
+            cursor = regionEnd >= endAddress ? endAddress : regionEnd;
+            if (cursor == endAddress)
+            {
+                break;
+            }
+        }
+
+        if (cursor != endAddress)
+        {
+            return false;
+        }
+
+        foreach (var region in affected)
+        {
+            _mappedRegions.Remove(region.Address);
+        }
+
+        foreach (var region in affected)
+        {
+            var regionEnd = region.Address + region.Length;
+            var protectStart = Math.Max(region.Address, address);
+            var protectEnd = Math.Min(regionEnd, endAddress);
+
+            if (region.Address < protectStart)
+            {
+                AddMappedRegionSliceLocked(region, region.Address, protectStart, region.Protection);
+            }
+
+            AddMappedRegionSliceLocked(region, protectStart, protectEnd, protection);
+
+            if (protectEnd < regionEnd)
+            {
+                AddMappedRegionSliceLocked(region, protectEnd, regionEnd, region.Protection);
+            }
+
+            if (memoryType.HasValue && region.IsDirect && TryFindDirectAllocationLocked(region.DirectStart, out var allocation))
+            {
+                _directAllocations[allocation.Start] = allocation with { MemoryType = memoryType.Value };
+            }
         }
 
         return true;
+    }
+
+    private static void AddMappedRegionSliceLocked(
+        MappedRegion source,
+        ulong start,
+        ulong end,
+        int protection)
+    {
+        if (end <= start)
+        {
+            return;
+        }
+
+        var directStart = source.IsDirect
+            ? unchecked(source.DirectStart + (start - source.Address))
+            : 0UL;
+
+        _mappedRegions[start] = source with
+        {
+            Address = start,
+            Length = end - start,
+            Protection = protection,
+            DirectStart = directStart,
+        };
+    }
+
+    private static bool TryFindDirectAllocationLocked(ulong directStart, out DirectAllocation allocation)
+    {
+        foreach (var candidate in _directAllocations.Values)
+        {
+            if (!TryAddU64(candidate.Start, candidate.Length, out var candidateEnd))
+            {
+                continue;
+            }
+
+            if (directStart >= candidate.Start && directStart < candidateEnd)
+            {
+                allocation = candidate;
+                return true;
+            }
+        }
+
+        allocation = default;
+        return false;
+    }
+
+    private static bool TryNormalizeProtectRange(
+        ulong address,
+        ulong length,
+        out ulong alignedAddress,
+        out ulong alignedLength)
+    {
+        alignedAddress = 0;
+        alignedLength = 0;
+        if (length == 0 || !TryAddU64(address, length, out var endAddress))
+        {
+            return false;
+        }
+
+        alignedAddress = AlignDown(address, OrbisPageSize);
+        var alignedEnd = AlignUp(endAddress, OrbisPageSize);
+        alignedLength = alignedEnd - alignedAddress;
+        return alignedLength != 0;
+    }
+
+    private static bool TryProtectHostRange(ulong address, ulong length, int orbisProtection)
+    {
+        if (length == 0 || length > nuint.MaxValue)
+        {
+            return false;
+        }
+
+        var hostProtection = ResolveHostProtection(orbisProtection);
+        if (!VirtualProtect((nint)address, (nuint)length, hostProtection, out _))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static uint ResolveHostProtection(int orbisProtection)
+    {
+        var read = (orbisProtection & (OrbisProtCpuRead | OrbisProtGpuRead)) != 0;
+        var write = (orbisProtection & (OrbisProtCpuWrite | OrbisProtGpuWrite)) != 0;
+        var execute = (orbisProtection & OrbisProtCpuExec) != 0;
+
+        if (execute)
+        {
+            return write
+                ? HostPageExecuteReadWrite
+                : read
+                    ? HostPageExecuteRead
+                    : HostPageExecute;
+        }
+
+        return write
+            ? HostPageReadWrite
+            : read
+                ? HostPageReadOnly
+                : HostPageNoAccess;
     }
 
     private static bool TryFindVirtualQueryRegionLocked(ulong queryAddress, bool findNext, out MappedRegion region)
@@ -4907,13 +5215,13 @@ public static class KernelMemoryCompatExports
 
     private static bool HasRequiredProtection(uint protect, bool writeAccess)
     {
-        if ((protect & (PageNoAccess | PageGuard)) != 0)
+        if ((protect & (HostPageNoAccess | HostPageGuard)) != 0)
         {
             return false;
         }
 
-        const uint readableMask = PageReadOnly | PageReadWrite | PageWriteCopy | PageExecuteRead | PageExecuteReadWrite | PageExecuteWriteCopy;
-        const uint writableMask = PageReadWrite | PageWriteCopy | PageExecuteReadWrite | PageExecuteWriteCopy;
+        const uint readableMask = HostPageReadOnly | HostPageReadWrite | HostPageWriteCopy | HostPageExecuteRead | HostPageExecuteReadWrite | HostPageExecuteWriteCopy;
+        const uint writableMask = HostPageReadWrite | HostPageWriteCopy | HostPageExecuteReadWrite | HostPageExecuteWriteCopy;
         var expected = writeAccess ? writableMask : readableMask;
         return (protect & expected) != 0;
     }
@@ -5231,6 +5539,17 @@ public static class KernelMemoryCompatExports
 
         var mask = alignment - 1;
         return (value + mask) & ~mask;
+    }
+
+    private static ulong AlignDown(ulong value, ulong alignment)
+    {
+        if (alignment <= 1)
+        {
+            return value;
+        }
+
+        var mask = alignment - 1;
+        return value & ~mask;
     }
 
     private static bool TryAddU64(ulong left, ulong right, out ulong sum)

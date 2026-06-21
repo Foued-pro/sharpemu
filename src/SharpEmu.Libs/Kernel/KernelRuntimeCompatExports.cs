@@ -25,6 +25,7 @@ public static class KernelRuntimeCompatExports
     private const ulong TlsNewReplaceOffset = 0x300;
     private const int MallocReplaceSize = 0x70;
     private const int NewReplaceSize = 0x68;
+    private const int OrbisTimesecSize = sizeof(long) + sizeof(uint) + sizeof(uint);
     private const ulong ModuleInfoHandleOffset = 0x108;
     private const ulong ModuleInfoNameOffset = 0x10;
     private const int ModuleInfoNameMaxBytes = 64;
@@ -52,6 +53,7 @@ public static class KernelRuntimeCompatExports
     private static readonly object _prtApertureGate = new();
     private static readonly (ulong Base, ulong Size)[] _prtApertures = new (ulong Base, ulong Size)[3];
     private static int _stackChkFailCount;
+    private static long _usleepTraceCount;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate ulong RdtscDelegate();
@@ -64,31 +66,50 @@ public static class KernelRuntimeCompatExports
     public static int KernelUsleep(CpuContext ctx)
     {
         var micros = ctx[CpuRegister.Rdi];
+        TraceUsleepSpin(ctx, micros);
         if (micros == 0)
         {
             ctx[CpuRegister.Rax] = 0;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        var sleepMilliseconds = (int)Math.Min(micros / 1000UL, int.MaxValue);
-        if (sleepMilliseconds > 0)
+        if (micros < 1000)
         {
-            Thread.Sleep(sleepMilliseconds);
+            Thread.Yield();
         }
-
-        var remainingMicros = micros % 1000UL;
-        if (remainingMicros > 0)
+        else
         {
-            var targetTicks = (long)((double)remainingMicros * Stopwatch.Frequency / 1_000_000.0);
-            var spin = Stopwatch.StartNew();
-            while (spin.ElapsedTicks < targetTicks)
-            {
-                Thread.SpinWait(16);
-            }
+            var sleepMilliseconds = (int)Math.Min((micros + 999UL) / 1000UL, int.MaxValue);
+            Thread.Sleep(sleepMilliseconds);
         }
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static void TraceUsleepSpin(CpuContext ctx, ulong micros)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_USLEEP"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var count = Interlocked.Increment(ref _usleepTraceCount);
+        if (count > 32 && count % 10000 != 0)
+        {
+            return;
+        }
+
+        var rbx = ctx[CpuRegister.Rbx];
+        var lockAddress = rbx == 0 ? 0 : rbx + 0xF78;
+        var lockText = "unreadable";
+        if (lockAddress != 0 && ctx.TryReadUInt64(lockAddress, out var lockValue))
+        {
+            lockText = $"0x{lockValue:X16}";
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] usleep#{count}: usec={micros} rbx=0x{rbx:X16} lock@+F78=0x{lockAddress:X16}:{lockText} r13=0x{ctx[CpuRegister.R13]:X16} r14=0x{ctx[CpuRegister.R14]:X16} r15=0x{ctx[CpuRegister.R15]:X16}");
     }
 
     [SysAbiExport(
@@ -154,6 +175,37 @@ public static class KernelRuntimeCompatExports
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "n88vx3C5nW8",
+        ExportName = "gettimeofday",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixGettimeofday(CpuContext ctx)
+    {
+        var timeAddress = ctx[CpuRegister.Rdi];
+        var timezoneAddress = ctx[CpuRegister.Rsi];
+        var now = DateTimeOffset.UtcNow;
+        var seconds = now.ToUnixTimeSeconds();
+        var microseconds = (now.Ticks % TimeSpan.TicksPerSecond) / 10;
+
+        if (timeAddress != 0 &&
+            (!ctx.TryWriteUInt64(timeAddress, unchecked((ulong)seconds)) ||
+             !ctx.TryWriteUInt64(timeAddress + sizeof(long), unchecked((ulong)microseconds))))
+        {
+            return -1;
+        }
+
+        if (timezoneAddress != 0 &&
+            (!TryWriteInt32(ctx, timezoneAddress, 0) ||
+             !TryWriteInt32(ctx, timezoneAddress + sizeof(int), 0)))
+        {
+            return -1;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
     }
 
     [SysAbiExport(
@@ -549,6 +601,17 @@ public static class KernelRuntimeCompatExports
         }
 
         ctx[CpuRegister.Rax] = address;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "jh+8XiK4LeE",
+        ExportName = "sceKernelIsAddressSanitizerEnabled",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelIsAddressSanitizerEnabled(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1016,6 +1079,111 @@ public static class KernelRuntimeCompatExports
         Span<byte> zero = stackalloc byte[AioInitParamSize];
         zero.Clear();
         if (!ctx.Memory.TryWrite(paramAddress, zero))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "-o5uEDpN+oY",
+        ExportName = "sceKernelConvertUtcToLocaltime",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelConvertUtcToLocaltime(CpuContext ctx)
+    {
+        var utcSeconds = unchecked((long)ctx[CpuRegister.Rdi]);
+        var localTimeAddress = ctx[CpuRegister.Rsi];
+        var timesecAddress = ctx[CpuRegister.Rdx];
+        var dstSecondsAddress = ctx[CpuRegister.Rcx];
+
+        if (localTimeAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var utc = DateTimeOffset.FromUnixTimeSeconds(utcSeconds);
+        var local = TimeZoneInfo.ConvertTime(utc, TimeZoneInfo.Local);
+        var offset = local.Offset;
+        var localSeconds = utcSeconds + (long)offset.TotalSeconds;
+        var dstSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(local.DateTime)
+            ? (uint)Math.Max(0, TimeZoneInfo.Local.GetAdjustmentRules()
+                .Where(rule => rule.DateStart <= local.Date && rule.DateEnd >= local.Date)
+                .Select(rule => rule.DaylightDelta.TotalSeconds)
+                .DefaultIfEmpty(0)
+                .Max())
+            : 0u;
+        var westSeconds = unchecked((uint)(int)offset.TotalSeconds);
+
+        if (!ctx.TryWriteUInt64(localTimeAddress, unchecked((ulong)localSeconds)))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (timesecAddress != 0)
+        {
+            Span<byte> timesec = stackalloc byte[OrbisTimesecSize];
+            BinaryPrimitives.WriteInt64LittleEndian(timesec, utcSeconds);
+            BinaryPrimitives.WriteUInt32LittleEndian(timesec.Slice(sizeof(long), sizeof(uint)), westSeconds);
+            BinaryPrimitives.WriteUInt32LittleEndian(timesec.Slice(sizeof(long) + sizeof(uint), sizeof(uint)), dstSeconds);
+            if (!ctx.Memory.TryWrite(timesecAddress, timesec))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+        }
+
+        if (dstSecondsAddress != 0 && !ctx.TryWriteUInt64(dstSecondsAddress, dstSeconds))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "0NTHN1NKONI",
+        ExportName = "sceKernelConvertLocaltimeToUtc",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelConvertLocaltimeToUtc(CpuContext ctx)
+    {
+        var localSeconds = unchecked((long)ctx[CpuRegister.Rdi]);
+        var utcTimeAddress = ctx[CpuRegister.Rdx];
+        var timezoneAddress = ctx[CpuRegister.Rcx];
+        var dstSecondsAddress = ctx[CpuRegister.R8];
+
+        if (timezoneAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var localDate = DateTimeOffset.FromUnixTimeSeconds(localSeconds).DateTime;
+        var offset = TimeZoneInfo.Local.GetUtcOffset(localDate);
+        var utcSeconds = localSeconds - (long)offset.TotalSeconds;
+        var dstSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(localDate)
+            ? (int)Math.Max(0, TimeZoneInfo.Local.GetAdjustmentRules()
+                .Where(rule => rule.DateStart <= localDate.Date && rule.DateEnd >= localDate.Date)
+                .Select(rule => rule.DaylightDelta.TotalSeconds)
+                .DefaultIfEmpty(0)
+                .Max())
+            : 0;
+        var minutesWest = unchecked((int)-offset.TotalMinutes);
+
+        if (!TryWriteInt32(ctx, timezoneAddress, minutesWest) ||
+            !TryWriteInt32(ctx, timezoneAddress + sizeof(int), dstSeconds / 60))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (utcTimeAddress != 0 && !ctx.TryWriteUInt64(utcTimeAddress, unchecked((ulong)utcSeconds)))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        if (dstSecondsAddress != 0 && !TryWriteInt32(ctx, dstSecondsAddress, dstSeconds))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
