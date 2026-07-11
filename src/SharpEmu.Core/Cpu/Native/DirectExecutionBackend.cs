@@ -1120,21 +1120,47 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				0x75, 0xF5,
 				0xC3,
 			],
-			"Q3VBxCXhUHs" =>
+			// "Q3VBxCXhUHs" (memcpy) intentionally excluded: the earlier "rep movsb" intrinsic
+			// had no bounds/null checking and crashed with a read at -1 right after a null-dst
+			// memset recovery in the same NGS2 audio streaming code path. The C# HLE memcpy
+			// already fails safely via TryReadCompat/TryWriteCompat instead of crashing.
+			// memset: guarded native fill. An earlier unguarded version crashed with a write AV
+			// at address 0 (NGS2 audio streaming init memsets a never-populated buffer field),
+			// so this one mirrors the HLE guards and silently returns dst without writing when
+			// dst is null/low-page (< 0x10000), dst is outside canonical user space, or len is
+			// absurd (> 512MB, e.g. the 0x27060035 / sign-extended values NGS2 passes). Routing
+			// memset through the HLE trampoline instead is not viable: parse/streaming loops
+			// issue hundreds of thousands of small memsets back-to-back, which crawls at
+			// dispatch speed and looks like a repeating-import hang to the loop guard.
+			// _sigprocmask: the HLE handler (KernelRuntimeCompatExports.Sigprocmask) is a pure
+			// no-op returning 0 that never writes oldset, so this is behavior-identical. The
+			// game's bundled libc queries the mask (set=NULL) once per iteration in its font/
+			// parse loops - hundreds of thousands of back-to-back calls that both crawl at
+			// dispatch speed and read as a repeating-import hang to the loop guard.
+			"6xVpy0Fdq+I" =>
 			[
-				0x48, 0x89, 0xF8,
-				0x48, 0x89, 0xD1,
-				0xF3, 0xA4,
-				0xC3,
+				0x31, 0xC0, // xor eax, eax
+				0xC3,       // ret
 			],
 			"8zTFvBIAIN8" =>
 			[
-				0x49, 0x89, 0xF8,
-				0x48, 0x89, 0xF0,
-				0x48, 0x89, 0xD1,
-				0xF3, 0xAA,
-				0x4C, 0x89, 0xC0,
-				0xC3,
+				0x48, 0x89, 0xF8,                                           // mov rax, rdi (return dst)
+				0x48, 0x81, 0xFF, 0x00, 0x00, 0x01, 0x00,                   // cmp rdi, 0x10000
+				0x72, 0x2B,                                                 // jb done
+				0x49, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, // mov r8, 0x800000000000
+				0x4C, 0x39, 0xC7,                                           // cmp rdi, r8
+				0x73, 0x1C,                                                 // jae done
+				0x48, 0x81, 0xFA, 0x00, 0x00, 0x00, 0x20,                   // cmp rdx, 0x20000000
+				0x77, 0x13,                                                 // ja done
+				0x48, 0x85, 0xD2,                                           // test rdx, rdx
+				0x74, 0x0E,                                                 // jz done
+				0x48, 0x89, 0xD1,                                           // mov rcx, rdx
+				0x49, 0x89, 0xF9,                                           // mov r9, rdi
+				0x89, 0xF0,                                                 // mov eax, esi
+				0xFC,                                                       // cld
+				0xF3, 0xAA,                                                 // rep stosb
+				0x4C, 0x89, 0xC8,                                           // mov rax, r9
+				0xC3,                                                       // done: ret
 			],
 			_ => default,
 		};
@@ -1353,10 +1379,25 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		return exportName switch
 		{
-			"memcpy" or
 			"memmove" or
-			"memset" or
-			"memcmp" => true,
+			// memset/memcpy excluded: the HLE implementations in KernelMemoryCompatExports.cs
+			// fail safely (return an error code) on bad pointers via TryReadCompat/TryWriteCompat
+			// null/bounds checks (observed hit during Quake's CL_Init, where a still-unidentified
+			// upstream bug calls memcpy/memset with a null destination); the raw LLE routines have
+			// no such guard and crash with an access violation instead.
+			"memcmp" or
+			// _Getpctype must come from the game's own Dinkumware libc when one is bundled:
+			// it returns a pointer to that CRT's ctype bitmask table, whose bit layout
+			// (_DI=0x20, _SP=0x04, _BB=0x80, ...) differs from the MSVC-style table the HLE
+			// fallback used to serve. Serving the wrong layout made the bundled printf engine
+			// render every Sys_Error message as an empty string (isdigit misfired during
+			// %-directive parsing) and made mcpp drop 'a'-'f' from identifiers ("texture" ->
+			// "txtur", the 0x80 bit reads as _BB/control there). _Getptolower/_Getptoupper
+			// already resolve to the bundled module because no HLE export shadows them; this
+			// keeps _Getpctype consistent with them. It is a pure accessor returning a pointer
+			// to a const table, so it is also the cheapest possible LLE call - important
+			// because parsers hit it once per input character.
+			"_Getpctype" => true,
 			_ => false,
 		};
 	}
