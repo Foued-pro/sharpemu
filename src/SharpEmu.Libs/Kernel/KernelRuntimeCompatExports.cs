@@ -14,6 +14,22 @@ namespace SharpEmu.Libs.Kernel;
 
 public static class KernelRuntimeCompatExports
 {
+    internal const int ClockRealtime = 0;
+    internal const int ClockVirtual = 1;
+    internal const int ClockProf = 2;
+    internal const int ClockMonotonic = 4;
+    internal const int ClockUptime = 5;
+    internal const int ClockUptimePrecise = 7;
+    internal const int ClockUptimeFast = 8;
+    internal const int ClockRealtimePrecise = 9;
+    internal const int ClockRealtimeFast = 10;
+    internal const int ClockMonotonicPrecise = 11;
+    internal const int ClockMonotonicFast = 12;
+    internal const int ClockSecond = 13;
+    internal const int ClockThreadCputimeId = 14;
+    internal const int ClockProcTime = 15;
+    private const int Efault = 14;
+    private const int Einval = 22;
     private const ulong TlsErrnoOffset = 0x40;
     private const ulong TlsStackChkGuardBaseOffset = 0x800;
     private const ulong StackChkGuardFieldOffset = 0x10;
@@ -63,6 +79,77 @@ public static class KernelRuntimeCompatExports
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate ulong RdtscDelegate();
+
+    [SysAbiExport(
+        Nid = "QvsZxomvUHs",
+        ExportName = "sceKernelNanosleep",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelNanosleep(CpuContext ctx)
+    {
+        var requestAddress = ctx[CpuRegister.Rdi];
+        var remainAddress = ctx[CpuRegister.Rsi];
+
+        if (requestAddress == 0)
+        {
+            ctx[CpuRegister.Rax] = Einval;
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        Span<byte> timespecBuffer = stackalloc byte[16];
+        if (!ctx.Memory.TryRead(requestAddress, timespecBuffer))
+        {
+            ctx[CpuRegister.Rax] = Efault;
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        var tvSec = BinaryPrimitives.ReadInt64LittleEndian(timespecBuffer);
+        var tvNsec = BinaryPrimitives.ReadInt64LittleEndian(timespecBuffer[sizeof(long)..]);
+
+        if (tvSec < 0 || tvNsec < 0 || tvNsec >= 1_000_000_000L)
+        {
+            ctx[CpuRegister.Rax] = Einval;
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (tvSec == 0 && tvNsec == 0)
+        {
+            WriteRemainingTime(ctx, remainAddress, 0, 0);
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        GuestThreadExecution.Scheduler?.Pump(ctx, "sceKernelNanosleep");
+
+        // TimeSpan resolution is 100 ns ticks, so sub-100 ns requests round up to
+        // a single tick rather than collapsing to a zero-length (no-op) sleep.
+        var totalTicks = tvSec * TimeSpan.TicksPerSecond + Math.Max(tvNsec / 100L, 1L);
+        try
+        {
+            Thread.Sleep(TimeSpan.FromTicks(totalTicks));
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            Thread.Sleep(TimeSpan.FromMilliseconds(int.MaxValue));
+        }
+
+        WriteRemainingTime(ctx, remainAddress, 0, 0);
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static void WriteRemainingTime(CpuContext ctx, ulong remainAddress, long seconds, long nanoseconds)
+    {
+        if (remainAddress == 0)
+        {
+            return;
+        }
+
+        Span<byte> remainBuffer = stackalloc byte[16];
+        BinaryPrimitives.WriteInt64LittleEndian(remainBuffer, seconds);
+        BinaryPrimitives.WriteInt64LittleEndian(remainBuffer[sizeof(long)..], nanoseconds);
+        ctx.Memory.TryWrite(remainAddress, remainBuffer);
+    }
 
     [SysAbiExport(
         Nid = "1jfXLRVzisc",
@@ -186,15 +273,9 @@ public static class KernelRuntimeCompatExports
 
         long seconds;
         long nanoseconds;
-        if (clockId == 0)
+        if (!ResolveClockTime(clockId, out seconds, out nanoseconds))
         {
-            var now = DateTimeOffset.UtcNow;
-            seconds = now.ToUnixTimeSeconds();
-            nanoseconds = (now.Ticks % TimeSpan.TicksPerSecond) * 100;
-        }
-        else
-        {
-            GetProcessMonotonicTime(out seconds, out nanoseconds);
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
         Span<byte> timespecBuffer = stackalloc byte[16];
@@ -226,8 +307,11 @@ public static class KernelRuntimeCompatExports
         var now = DateTimeOffset.UtcNow;
         var seconds = now.ToUnixTimeSeconds();
         var microseconds = (now.Ticks % TimeSpan.TicksPerSecond) / 10;
-        if (!ctx.TryWriteUInt64(timeAddress, unchecked((ulong)seconds)) ||
-            !ctx.TryWriteUInt64(timeAddress + sizeof(long), unchecked((ulong)microseconds)))
+
+        Span<byte> timevalBuffer = stackalloc byte[16];
+        BinaryPrimitives.WriteInt64LittleEndian(timevalBuffer, seconds);
+        BinaryPrimitives.WriteInt64LittleEndian(timevalBuffer[sizeof(long)..], microseconds);
+        if (!ctx.Memory.TryWrite(timeAddress, timevalBuffer))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -249,18 +333,28 @@ public static class KernelRuntimeCompatExports
         var seconds = now.ToUnixTimeSeconds();
         var microseconds = (now.Ticks % TimeSpan.TicksPerSecond) / 10;
 
-        if (timeAddress != 0 &&
-            (!ctx.TryWriteUInt64(timeAddress, unchecked((ulong)seconds)) ||
-             !ctx.TryWriteUInt64(timeAddress + sizeof(long), unchecked((ulong)microseconds))))
+        if (timeAddress != 0)
         {
-            return -1;
+            Span<byte> timevalBuffer = stackalloc byte[16];
+            BinaryPrimitives.WriteInt64LittleEndian(timevalBuffer, seconds);
+            BinaryPrimitives.WriteInt64LittleEndian(timevalBuffer[sizeof(long)..], microseconds);
+            if (!ctx.Memory.TryWrite(timeAddress, timevalBuffer))
+            {
+                TrySetErrno(ctx, Efault);
+                return -1;
+            }
         }
 
-        if (timezoneAddress != 0 &&
-            (!ctx.TryWriteInt32(timezoneAddress, 0) ||
-             !ctx.TryWriteInt32(timezoneAddress + sizeof(int), 0)))
+        if (timezoneAddress != 0)
         {
-            return -1;
+            Span<byte> timezoneBuffer = stackalloc byte[8];
+            BinaryPrimitives.WriteInt32LittleEndian(timezoneBuffer, 0);
+            BinaryPrimitives.WriteInt32LittleEndian(timezoneBuffer[sizeof(int)..], 0);
+            if (!ctx.Memory.TryWrite(timezoneAddress, timezoneBuffer))
+            {
+                TrySetErrno(ctx, Efault);
+                return -1;
+            }
         }
 
         ctx[CpuRegister.Rax] = 0;
@@ -616,6 +710,50 @@ public static class KernelRuntimeCompatExports
     {
         var address = GetTlsScratchAddress(ctx, TlsErrnoOffset);
         return address != 0 && ctx.TryWriteInt32(address, value);
+    }
+
+    internal static bool ResolveClockTime(int clockId, out long seconds, out long nanoseconds)
+    {
+        switch (clockId)
+        {
+            case ClockRealtime:
+            case ClockRealtimePrecise:
+            case ClockRealtimeFast:
+            case ClockVirtual:
+            case ClockProf:
+            {
+                var now = DateTimeOffset.UtcNow;
+                seconds = now.ToUnixTimeSeconds();
+                nanoseconds = (now.Ticks % TimeSpan.TicksPerSecond) * 100;
+                return true;
+            }
+
+            // CLOCK_SECOND is FreeBSD's cached whole-second realtime clock (Quake's
+            // audio_output_thread polls it and treated the previous EINVAL as a fatal
+            // init failure, exiting and getting respawned in a loop).
+            case ClockSecond:
+                seconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                nanoseconds = 0;
+                return true;
+
+            case ClockMonotonic:
+            case ClockMonotonicPrecise:
+            case ClockMonotonicFast:
+            case ClockUptime:
+            case ClockUptimePrecise:
+            case ClockUptimeFast:
+            // Per-thread/process CPU time approximated with the monotonic clock; games
+            // use these for profiling deltas where monotonicity matters, not absolutes.
+            case ClockThreadCputimeId:
+            case ClockProcTime:
+                GetProcessMonotonicTime(out seconds, out nanoseconds);
+                return true;
+
+            default:
+                seconds = 0;
+                nanoseconds = 0;
+                return false;
+        }
     }
 
     internal static void GetProcessMonotonicTime(out long seconds, out long nanoseconds)
