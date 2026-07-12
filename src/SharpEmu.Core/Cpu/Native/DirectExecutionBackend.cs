@@ -3845,10 +3845,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
             return GuestNativeCallExitReason.Exception;
         }
         FlushInstructionCache(GetCurrentProcess(), ptr, stubSize);
-        TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot);
         ActiveGuestThreadYieldRequested = false;
         ActiveGuestThreadYieldReason = null;
-        var nativeReturn = CallNativeEntry(ptr);
+        var nativeReturn = RunGuestEntryStub(ptr, hostRspSlot);
         if (ActiveGuestThreadYieldRequested)
         {
             reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -3989,13 +3988,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				return GuestNativeCallExitReason.Exception;
 			}
 			FlushInstructionCache(GetCurrentProcess(), ptr, stubSize);
-			TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot);
 			ActiveGuestThreadYieldRequested = false;
 			ActiveGuestThreadYieldReason = null;
 
 			try
 			{
-				var nativeReturn = CallNativeEntry(ptr);
+				var nativeReturn = RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -4271,7 +4269,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			int num6 = -1;
 			try
 			{
-				num6 = CallNativeEntry(ptr);
+				num6 = RunGuestEntryStub(ptr, num2);
 				Console.Error.WriteLine($"[LOADER][INFO] Guest returned: {num6}");
 				PumpUntilGuestThreadsIdle(context, "entry_return");
 			}
@@ -4647,6 +4645,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				"[LOADER][WARN] Skipping executable stub teardown: guest worker threads are still running.");
 			return;
 		}
+		// Native guest workers park idle once every guest thread has unwound; stop
+		// them before any executable stub or TLS index they reference is freed.
+		DisposeNativeGuestExecutors();
 		ClearImportHandlerTrampolines();
 		_importEntries = Array.Empty<ImportStubEntry>();
 		_runtimeSymbolsByName.Clear();
