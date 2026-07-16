@@ -52,4 +52,96 @@ public static class AcmExports
         ctx[CpuRegister.Rax] = 0;
         return 0;
     }
+
+    // DSP batch submission and synchronization. The emulator runs no ACM DSP
+    // jobs (FFT/panner/reverb output stays silent), but Scream's workers trap
+    // with int 0x41/0x42 asserts whenever a submission call reports failure,
+    // so the whole batch surface must report success.
+    [SysAbiExport(
+        Nid = "WeZOIm8+8WI",
+        ExportName = "sceAcmBatchInitialize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAcm")]
+    public static int AcmBatchInitialize(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    [SysAbiExport(
+        Nid = "Mk1xvQXIdkk",
+        ExportName = "sceAcmBatchInitializeLite",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAcm")]
+    public static int AcmBatchInitializeLite(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    [SysAbiExport(
+        Nid = "A5NXCXK5Gfc",
+        ExportName = "sceAcmBatchStart",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAcm")]
+    public static int AcmBatchStart(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    [SysAbiExport(
+        Nid = "tW9W+CAG4FE",
+        ExportName = "sceAcmBatchStartBuffer",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAcm")]
+    public static int AcmBatchStartBuffer(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    [SysAbiExport(
+        Nid = "8fe55ktlNVo",
+        ExportName = "sceAcmBatchStartBuffers",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAcm")]
+    public static int AcmBatchStartBuffers(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    [SysAbiExport(
+        Nid = "S3BPrjCfZ90",
+        ExportName = "sceAcmBatchStartMultiple",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAcm")]
+    public static int AcmBatchStartMultiple(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    [SysAbiExport(
+        Nid = "uqDIauipRbo",
+        ExportName = "sceAcmBatchProcess",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAcm")]
+    public static int AcmBatchProcess(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    [SysAbiExport(
+        Nid = "RLN3gRlXJLE",
+        ExportName = "sceAcmBatchWait",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAcm")]
+    public static int AcmBatchWait(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
 }

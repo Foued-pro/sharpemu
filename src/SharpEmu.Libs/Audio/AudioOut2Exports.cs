@@ -290,10 +290,13 @@ public static class AudioOut2Exports
             _ = ctx.TryWriteUInt32(levelAddress, 0);
         }
 
-        var secondaryLevelAddress = ctx[CpuRegister.Rdx];
-        if (secondaryLevelAddress != 0)
+        // Second output is the queue headroom. It must be nonzero: the NCA
+        // pump busy-polls this call until space is reported before it pushes
+        // decoded audio, and the title's main thread waits on the pump.
+        var availableAddress = ctx[CpuRegister.Rdx];
+        if (availableAddress != 0)
         {
-            _ = ctx.TryWriteUInt32(secondaryLevelAddress, 0);
+            _ = ctx.TryWriteUInt32(availableAddress, 8);
         }
 
         return SetReturn(ctx, 0);

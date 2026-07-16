@@ -102,6 +102,36 @@ public static class AjmExports
         return 0;
     }
 
+    // Batch submission: the emulator has no codec DMA engine to run the jobs,
+    // but the caller treats any nonzero status as fatal (Ghost of Yotei traps
+    // on int 0x42 when sceAjmBatchStart fails). Accepting the batch keeps the
+    // pipeline flowing; decoded output stays silent until real AJM decoding
+    // is implemented.
+    [SysAbiExport(
+        Nid = "5tOfnaClcqM",
+        ExportName = "sceAjmBatchStart",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchStart(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    // Reads accounting data out of a caller-owned batch object; the caller
+    // only logs the numbers, so reporting success without touching the batch
+    // is safe.
+    [SysAbiExport(
+        Nid = "3cAg7xN995U",
+        ExportName = "sceAjmBatchJobGetStatistics",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchJobGetStatistics(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
     // On hardware these pin guest direct memory for the codec DMA engine. The
     // emulator decodes entirely on the host, so registration is bookkeeping
     // only — but it must report success: Ghost of Yotei's audio arena
