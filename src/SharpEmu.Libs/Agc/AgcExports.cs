@@ -10891,6 +10891,21 @@ public static partial class AgcExports
         return ReturnPointer(ctx, cmd);
     }
 
+    // Byte size of the packet DcbJump records. Callers reserve this many
+    // bytes of tail space in every command-buffer chunk so a jump to the
+    // next chunk always fits (Ghost of Yotei divides it by 4 and stores it
+    // as its chunk manager's reserved-dword count).
+    [SysAbiExport(
+        Nid = "VEGu4dixjUg",
+        ExportName = "sceAgcDcbJumpGetSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbJumpGetSize(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 4u * sizeof(uint);
+        return (int)ctx[CpuRegister.Rax];
+    }
+
     [SysAbiExport(
         Nid = "bbFueFP+J4k",
         ExportName = "sceAgcDcbSetPredication",
