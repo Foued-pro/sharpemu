@@ -4405,11 +4405,14 @@ internal static unsafe class VulkanVideoPresenter
             CollectCompletedGuestSubmissions(waitForOldest: false);
             var waitedMs = (System.Diagnostics.Stopwatch.GetTimestamp() - waitStart) *
                 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            TraceVulkanShader(
-                $"vk.queue_visibility queue={_activeGuestQueue.Name} " +
-                $"submission={_activeGuestQueue.SubmissionId} " +
-                $"target_timeline={targetTimeline} completed_timeline={_completedTimeline} " +
-                $"waited_ms={waitedMs:F3}");
+            if (_traceVulkanShaderEnabled)
+            {
+                TraceVulkanShader(
+                    $"vk.queue_visibility queue={_activeGuestQueue.Name} " +
+                    $"submission={_activeGuestQueue.SubmissionId} " +
+                    $"target_timeline={targetTimeline} completed_timeline={_completedTimeline} " +
+                    $"waited_ms={waitedMs:F3}");
+            }
         }
 
         private void ExecuteOrderedGuestAction(VulkanOrderedGuestAction work)
@@ -4417,10 +4420,13 @@ internal static unsafe class VulkanVideoPresenter
             WaitForActiveGuestQueueSubmissionsForCpuVisibility();
             WriteBackAllDirtyGuestBuffers(_activeGuestQueue.Name);
             work.Action();
-            TraceVulkanShader(
-                $"vk.ordered_action queue={_activeGuestQueue.Name} " +
-                $"submission={_activeGuestQueue.SubmissionId} " +
-                $"work_sequence={_activeGuestWorkSequence} name='{work.DebugName}'");
+            if (_traceVulkanShaderEnabled)
+            {
+                TraceVulkanShader(
+                    $"vk.ordered_action queue={_activeGuestQueue.Name} " +
+                    $"submission={_activeGuestQueue.SubmissionId} " +
+                    $"work_sequence={_activeGuestWorkSequence} name='{work.DebugName}'");
+            }
         }
 
         private void ExecuteOrderedGuestFlip(VulkanOrderedGuestFlip work)
@@ -7529,21 +7535,43 @@ internal static unsafe class VulkanVideoPresenter
 
             var size = (ulong)Math.Max(guestBuffer.Length, sizeof(uint));
             var endAddress = checked(guestBuffer.BaseAddress + size);
-            var allocation = _guestBufferAllocations
-                .Where(candidate =>
-                    candidate.BaseAddress <= guestBuffer.BaseAddress &&
-                    candidate.BaseAddress + candidate.Size >= endAddress)
-                .OrderByDescending(candidate =>
-                    string.Equals(
+            GuestBufferAllocation? allocation = null;
+            var allocationPriority = -1;
+            // This runs for every bound global buffer. Preserve the previous
+            // stable queue preference without allocating LINQ sort state.
+            foreach (var candidate in _guestBufferAllocations)
+            {
+                if (candidate.BaseAddress > guestBuffer.BaseAddress ||
+                    candidate.BaseAddress + candidate.Size < endAddress)
+                {
+                    continue;
+                }
+
+                var candidatePriority = string.Equals(
                         candidate.QueueName,
                         _activeGuestQueue.Name,
-                        StringComparison.Ordinal))
-                .ThenByDescending(candidate =>
-                    string.Equals(
+                        StringComparison.Ordinal)
+                    ? 2
+                    : string.Equals(
                         candidate.QueueName,
                         SharedReadOnlyGuestBufferQueue,
-                        StringComparison.Ordinal))
-                .First();
+                        StringComparison.Ordinal)
+                        ? 1
+                        : 0;
+                if (candidatePriority > allocationPriority)
+                {
+                    allocation = candidate;
+                    allocationPriority = candidatePriority;
+                }
+            }
+
+            if (allocation is null)
+            {
+                throw new InvalidOperationException(
+                    $"no Vulkan guest buffer allocation covers " +
+                    $"0x{guestBuffer.BaseAddress:X16}-0x{endAddress:X16}");
+            }
+
             var guestOffset = guestBuffer.BaseAddress - allocation.BaseAddress;
             var descriptorOffset = guestOffset &
                 ~(GuestStorageBufferOffsetAlignment - 1);
@@ -7592,16 +7620,15 @@ internal static unsafe class VulkanVideoPresenter
                     WaitForActiveGuestQueueSubmissionsForCpuVisibility();
                     WriteBackAllDirtyGuestBuffers(_activeGuestQueue.Name);
                 }
-                var live = new byte[guestBuffer.Length];
-                if (_guestMemory?.TryRead(guestBuffer.BaseAddress, live) == true)
+                var mapped = new Span<byte>(
+                    (void*)(allocation.Mapped + checked((nint)guestOffset)),
+                    guestBuffer.Length);
+                if (_guestMemory?.TryRead(guestBuffer.BaseAddress, mapped) != true)
                 {
-                    source = live;
+                    source.CopyTo(mapped);
                 }
 
-                source.CopyTo(new Span<byte>(
-                    (void*)(allocation.Mapped + checked((nint)guestOffset)),
-                    source.Length));
-                source.CopyTo(shadow);
+                mapped.CopyTo(shadow);
             }
 
             if (ShouldTraceVulkanResources() &&
@@ -7611,14 +7638,6 @@ internal static unsafe class VulkanVideoPresenter
                     $"[LOADER][TRACE] vk.global_buffer base=0x{guestBuffer.BaseAddress:X16} " +
                     $"bytes={guestBuffer.Length}");
             }
-            if (_setDebugUtilsObjectName is not null)
-            {
-                SetDebugName(
-                    ObjectType.Buffer,
-                    allocation.Buffer.Handle,
-                    $"SharpEmu global 0x{guestBuffer.BaseAddress:X16} {guestBuffer.Length}b");
-            }
-
             if (guestBuffer.Pooled)
             {
                 GuestDataPool.Return(guestBuffer.Data);
@@ -9890,10 +9909,13 @@ internal static unsafe class VulkanVideoPresenter
                         }
                     }
                 }
-                TraceVulkanShader(
-                    $"vk.offscreen_draw mrt={targets.Length} " +
-                    $"size={firstTarget.Width}x{firstTarget.Height} " +
-                    $"textures={work.Draw.Textures.Count}");
+                if (_traceVulkanShaderEnabled)
+                {
+                    TraceVulkanShader(
+                        $"vk.offscreen_draw mrt={targets.Length} " +
+                        $"size={firstTarget.Width}x{firstTarget.Height} " +
+                        $"textures={work.Draw.Textures.Count}");
+                }
             }
             catch (Exception exception)
             {
