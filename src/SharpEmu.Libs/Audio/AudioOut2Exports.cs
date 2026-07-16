@@ -79,6 +79,46 @@ public static class AudioOut2Exports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // Ghost of Yotei calls this with flags=0 during Scream startup and never
+    // checks the result before continuing into its mastering path; the actual
+    // mastering chain lives in the host mixer, so accepting the request is
+    // sufficient.
+    [SysAbiExport(
+        Nid = "XHl38ZNknbs",
+        ExportName = "sceAudioOut2MasteringInit",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2MasteringInit(CpuContext ctx)
+    {
+        return SetReturn(ctx, 0);
+    }
+
+    // Context-level attribute updates (3D object counts, submix routing, …)
+    // configure the hardware mixer; the host mixer accepts any configuration,
+    // and a failure aborts Yotei's audio arena bring-up.
+    [SysAbiExport(
+        Nid = "4dq2rblWlg0",
+        ExportName = "sceAudioOut2ContextSetAttributes",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2ContextSetAttributes(CpuContext ctx)
+    {
+        return SetReturn(ctx, 0);
+    }
+
+    // 3D-audio object latency hint; the host mixer has no object pipeline to
+    // tune, but failure here makes Yotei tear down its whole ACM context and
+    // abort audio arena bring-up.
+    [SysAbiExport(
+        Nid = "TViD1EZXkNI",
+        ExportName = "sceAudioOut2Set3DLatency",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAudioOut2")]
+    public static int AudioOut2Set3DLatency(CpuContext ctx)
+    {
+        return SetReturn(ctx, 0);
+    }
+
     [SysAbiExport(
         Nid = "t5YrizufpQc",
         ExportName = "sceAudioOut2ContextResetParam",
@@ -241,10 +281,19 @@ public static class AudioOut2Exports
     public static int AudioOut2ContextGetQueueLevel(CpuContext ctx)
     {
         // The advance path paces synchronously, so the queue is always drained.
+        // Both outputs are 32-bit: Ghost of Yotei's NCA pump passes two stack
+        // slots 4 bytes apart with its stack canary directly above them, so a
+        // 64-bit write here smashes the canary and kills the thread.
         var levelAddress = ctx[CpuRegister.Rsi];
         if (levelAddress != 0)
         {
-            _ = TryWriteUInt64(ctx, levelAddress, 0);
+            _ = ctx.TryWriteUInt32(levelAddress, 0);
+        }
+
+        var secondaryLevelAddress = ctx[CpuRegister.Rdx];
+        if (secondaryLevelAddress != 0)
+        {
+            _ = ctx.TryWriteUInt32(secondaryLevelAddress, 0);
         }
 
         return SetReturn(ctx, 0);
@@ -260,8 +309,10 @@ public static class AudioOut2Exports
         var type = unchecked((int)ctx[CpuRegister.Rdi]);
         var paramAddress = ctx[CpuRegister.Rsi];
         var outPortAddress = ctx[CpuRegister.Rdx];
-        var contextAddress = ctx[CpuRegister.Rcx];
-        if (type < 0 || type > 255 || paramAddress == 0 || outPortAddress == 0 || contextAddress == 0)
+        // rcx is optional: Scream titles (Ghost of Yotei) pass the context
+        // handle in rdi and leave rcx zero, so a null fourth argument must
+        // not be rejected.
+        if (type < 0 || type > 255 || paramAddress == 0 || outPortAddress == 0)
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
