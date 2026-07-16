@@ -117,8 +117,62 @@ Le NULL vient donc d'encore plus tôt. Candidats observés dans le même run
 `sceAgcCreateShader` type=5 (hull shader) : 6 échecs/run, non fatals — voir
 section plus haut. Hypothèse prête (case 5 → lo=0x10A hi=0x10B).
 
-### Prochaine hypothèse (pour la prochaine session)
+## 2026-07-17 (suite) — Chaîne du NULL remontée et résolue
 
-Identifier lequel des appels échouants en amont produit le pointeur NULL
-consommé à 0x80161279F/0x8016127C4 : désassembler la fonction 0x801612xxx
-autour des deux call-sites pour voir d'où vient rdi, puis remonter.
+### Méthode (capstone offline + hash NID)
+
+1. Désassemblage de la fonction 0x801612680 : writer de registres UC en
+   anneau. Le NULL naît au `call 0x8016cced0` (thunk) qui retourne rax=0,
+   stocké [rbx+0x30], puis propagé dans `6lNcCp+fxi4` (rdi=0) et dans un
+   memcpy libc vers un buffer NULL.
+2. Mapping GOT→NID reconstruit statiquement depuis les relocations JMPREL
+   de l'eboot (strtab 0x1FB9990, symtab 0x1FBCCE8, jmprel 0x1FC0EE8) ;
+   bibliothèques résolues via les tags 0x61000049 du PT_DYNAMIC.
+3. Identités confirmées : hvUfkUIQcOE=sceAgcDcbSetUcRegistersIndirect (le
+   NULL vient de LUI : TryAllocateCommandDwords → buffer plein),
+   6lNcCp+fxi4=sceAgcSetUcRegIndirectPatchSetAddress, Q3VBxCXhUHs=memcpy
+   (hash NID vérifié), Q4qBuN-c0ZM=sceNetSocket (échec toléré),
+   rqwFKI4PAiM=sceKernelAprWaitCommandBuffer, xddD23+8TfQ=
+   libSceNpEntitlementAccess (boucle de 9, tolérée),
+   xSAR0LTcRKM=sceAgcDcbJump, h9z6+0hEydk=sceAgcSuspendPoint.
+4. Cause racine : **VEGu4dixjUg = sceAgcDcbJumpGetSize** (match hash exact,
+   méthode validée sur memcpy/sceNetSocket/sceAgcCreateShader). Non résolu,
+   il retournait 0x80020002 → le jeu stockait 0x20008000 comme réserve de
+   dwords par chunk → pool de 64 chunks épuisé dès l'init → callback de
+   croissance refusait (index chunk > 0x3F) → SetUcRegistersIndirect
+   rendait NULL → crash memcpy.
+
+### Fix (commit 751d49e) — VÉRIFIÉ
+
+`sceAgcDcbJumpGetSize` retourne 16 (= paquet IT_INDIRECT_BUFFER de 4 dwords
+que notre DcbJump écrit). Résultat mesuré : progression de l'import ~#32K
+à **#3 691 520** (~115×), les callbacks de croissance réussissent, le jeu
+TERMINE son init renderer.
+
+### NOUVEAU MUR : boucle de poll sceVideoOutGetFlipStatus
+
+Le jeu atteint la logique de présentation et poll `sceVideoOutGetFlipStatus`
+(SbU3dwp80lQ, handle=1) ~3,6 M de fois depuis l'import ~#100K ; c'est le
+garde anti-boucle qui a tué le run (import#3691520, ret=0x800CD1335), pas
+un crash du jeu. Même classe que les stalls flip Quake/Doom (cf. mémoires
+quake-flip-pacing-stall / doom-flip-loop-root-cause / vblank-implicit-flip).
+Particularité Yotei : **zéro sceAgcDriverSubmitDcb dans tout le run** — le
+jeu poll le statut flip sans avoir soumis par ce NID ; soit il soumet par
+un autre chemin, soit il attend un compteur vblank/flip que notre
+GetFlipStatus ne fait pas avancer. À instrumenter : contenu du FlipStatus
+retourné + champ que la boucle 0x800CD1335 teste (désassembler autour).
+
+### Piste APR (probable ex-« compteur 6 » de FaWorkerIo1)
+
+`sceKernelAprWaitCommandBuffer(-1, 3, n, n-1, out)` appelé avec id=-1
+(« attendre tout ») → notre impl exige un id précis → NOT_FOUND, répété
+pour n=1..7. Le jeu tolère (ça ne bloque plus le boot ici), mais c'est le
+middleware I/O async du shader-cache (all_shaders.xpps). xnetcat a une impl
+de ce NID (sharpemu-xnetcat/KernelAprCompatExports.cs) — à comparer.
+
+### Hypothèses en attente (dans l'ordre)
+
+1. Boucle GetFlipStatus (nouveau mur ci-dessus).
+2. create_shader type=5 (hull shader) : case `5 => lo=0x10A hi=0x10B` dans
+   PatchShaderProgramRegisters — 6 échecs non fatals par run.
+3. AprWaitCommandBuffer id=-1.
