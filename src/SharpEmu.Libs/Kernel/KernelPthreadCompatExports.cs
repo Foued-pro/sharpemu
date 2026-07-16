@@ -897,17 +897,16 @@ public static class KernelPthreadCompatExports
             return 0;
         }
 
-        if (_mutexStates.ContainsKey(mutexAddress))
+        // The kernel handle stored in the guest object is the mutex identity;
+        // the object address is not (callers copy handles into stack locals
+        // that get reused for other mutexes), so the content must win over
+        // any state previously registered under the same address.
+        if (KernelMemoryCompatExports.TryReadUInt64Compat(ctx, mutexAddress, out var pointedHandle) &&
+            pointedHandle != 0 &&
+            pointedHandle != mutexAddress &&
+            _mutexStates.ContainsKey(pointedHandle))
         {
-            return mutexAddress;
-        }
-
-        if (KernelMemoryCompatExports.TryReadUInt64Compat(ctx, mutexAddress, out var pointedHandle) && pointedHandle != 0)
-        {
-            if (_mutexStates.ContainsKey(pointedHandle))
-            {
-                return pointedHandle;
-            }
+            return pointedHandle;
         }
 
         return mutexAddress;
@@ -922,13 +921,29 @@ public static class KernelPthreadCompatExports
             return false;
         }
 
+        // The kernel handle stored in the guest object is the mutex identity;
+        // the object address is not. Scream copies mutex handles into stack
+        // locals and reuses the same slot for different mutexes, so a state
+        // cached under the slot address goes stale: the handle read from the
+        // object must win over the address-keyed lookup.
+        var hasContent = KernelMemoryCompatExports.TryReadUInt64Compat(ctx, mutexAddress, out var pointedHandle);
+        if (hasContent &&
+            pointedHandle != 0 &&
+            pointedHandle != mutexAddress &&
+            _mutexStates.TryGetValue(pointedHandle, out state))
+        {
+            _mutexStates[mutexAddress] = state;
+            resolvedAddress = pointedHandle;
+            return true;
+        }
+
         if (_mutexStates.TryGetValue(mutexAddress, out state))
         {
             resolvedAddress = mutexAddress;
             return true;
         }
 
-        if (!KernelMemoryCompatExports.TryReadUInt64Compat(ctx, mutexAddress, out var pointedHandle))
+        if (!hasContent)
         {
             return false;
         }
@@ -940,13 +955,6 @@ public static class KernelPthreadCompatExports
 
         if (pointedHandle != 0)
         {
-            if (_mutexStates.TryGetValue(pointedHandle, out state))
-            {
-                _mutexStates.TryAdd(mutexAddress, state);
-                resolvedAddress = pointedHandle;
-                return true;
-            }
-
             resolvedAddress = pointedHandle;
             return false;
         }
