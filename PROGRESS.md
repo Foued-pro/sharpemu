@@ -170,9 +170,62 @@ pour n=1..7. Le jeu tolère (ça ne bloque plus le boot ici), mais c'est le
 middleware I/O async du shader-cache (all_shaders.xpps). xnetcat a une impl
 de ce NID (sharpemu-xnetcat/KernelAprCompatExports.cs) — à comparer.
 
+### Boucle GetFlipStatus — RÉSOLUE (commit dcd5e8b)
+
+Désassemblage de la boucle (ret 0x800CD1335, décrypté eboot) :
+
+```
+lea rsi, [rbp-0xb0]        ; buffer FlipStatus, JAMAIS pré-zéré côté guest
+call SbU3dwp80lQ            ; sceVideoOutGetFlipStatus(handle, &status)
+cmp dword ptr [rbp-0x7c], 0 ; teste offset 0x34 de la struct
+je  <sortie>                 ; 0 → pas de flip en attente
+mov edi, 1 ; call 1jfXLRVzisc ; sceKernelUsleep(1)
+...        ; call SbU3dwp80lQ ; re-teste
+jne  <boucle>
+```
+
+Notre `VideoOutGetFlipStatus` (VideoOutExports.cs) n'écrivait que les
+offsets 0x00-0x27 (count, réservé×3, currentBuffer). L'offset 0x34, jamais
+touché, contenait de la mémoire de pile non initialisée côté guest → si
+non nulle par hasard, boucle infinie (3,6M appels avant que le garde
+anti-boucle tue le process).
+
+Fix : zéro-remplissage étendu jusqu'à 0x37 inclus. Justifié par un
+invariant déjà présent dans le code, pas une invention : `SubmitFlip` est
+synchrone (met à jour FlipCount/CurrentBuffer immédiatement,
+VideoOutExports.cs:1090-1091) et l'export `sceVideoOutIsFlipPending`
+retourne toujours "non" — donc "aucun flip en attente" partout est déjà
+la sémantique du reste du code.
+
+Vérifié : 0 appel `GetFlipStatus` dans le run suivant (contre 3,6M avant),
+le jeu enchaîne sur un vrai travail GPU compute (`agc.compute_writer
+size=960x540 op=ImageStore fmt=4`).
+
+### NOUVEAU MUR : CLR fatal error pré-existant (documenté, STOP)
+
+```
+Fatal error.
+Invalid Program: attempted to call a UnmanagedCallersOnly method from managed code.
+   at DirectExecutionBackend.CallNativeEntry
+   at DirectExecutionBackend.ExecuteGuestContinuationEntry
+   at DirectExecutionBackend.ExecuteBlockedGuestThreadContinuation
+   at DirectExecutionBackend.RunGuestThread
+```
+
+Exit 6 = fatal error du runtime .NET lui-même (pas un `Environment.Exit`
+de notre code — grep du source ne trouve aucun `exit(6)`, cohérent avec
+un fail-fast CLR). Ce crash est **déjà documenté** dans la mémoire
+`unmanagedcallersonly-fatal` : CLR fatal sur les cycles de
+création/sortie de thread guest, préexistant, sans lien avec le travail
+d'aujourd'hui. Pas d'instrumentation supplémentaire faite dans cette
+session — à reprendre séparément (probablement lié au cycle de threads
+audio ou de continuation de thread guest bloqué, à confirmer par capture
+du NID/nom de thread juste avant le fatal).
+
 ### Hypothèses en attente (dans l'ordre)
 
-1. Boucle GetFlipStatus (nouveau mur ci-dessus).
+1. CLR fatal UnmanagedCallersOnly (nouveau mur ci-dessus, prioritaire —
+   bloque toute progression au-delà du premier travail GPU réel).
 2. create_shader type=5 (hull shader) : case `5 => lo=0x10A hi=0x10B` dans
    PatchShaderProgramRegisters — 6 échecs non fatals par run.
 3. AprWaitCommandBuffer id=-1.
