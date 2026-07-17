@@ -619,15 +619,37 @@ public static class KernelEventQueueCompatExports
                         _pendingEvents[handle] = queue;
                     }
 
-                    QueueOrUpdateEvent(
-                        queue,
-                        new KernelQueuedEvent(
-                            registration.Ident,
-                            registration.Filter,
-                            0,
-                            1,
-                            data,
-                            registration.UserData));
+                    // GPU interrupt events must not coalesce: the AGC driver's
+                    // interrupt thread accounts exactly one completion per
+                    // delivered kevent (it never reads the kevent payload), so
+                    // merging N triggers into one pending entry silently drops
+                    // N-1 completions and wedges its dependency counters. Queue
+                    // a distinct entry per trigger, with a defensive cap so an
+                    // undrained queue cannot grow without bound.
+                    if (CountPendingEvents(queue, registration.Ident, registration.Filter) < 256)
+                    {
+                        queue.AddLast(
+                            new KernelQueuedEvent(
+                                registration.Ident,
+                                registration.Filter,
+                                0,
+                                1,
+                                data,
+                                registration.UserData));
+                    }
+                    else
+                    {
+                        QueueOrUpdateEvent(
+                            queue,
+                            new KernelQueuedEvent(
+                                registration.Ident,
+                                registration.Filter,
+                                0,
+                                1,
+                                data,
+                                registration.UserData));
+                    }
+
                     (wakeHandles ??= new List<ulong>()).Add(handle);
                     triggeredCount++;
 
@@ -822,6 +844,24 @@ public static class KernelEventQueueCompatExports
         {
             return _pendingEvents.TryGetValue(handle, out var events) && events.Count != 0;
         }
+    }
+
+    private static int CountPendingEvents(
+        KernelEventDeque queue,
+        ulong ident,
+        short filter)
+    {
+        var count = 0;
+        for (var i = 0; i < queue.Count; i++)
+        {
+            var pending = queue[i];
+            if (pending.Ident == ident && pending.Filter == filter)
+            {
+                count++;
+            }
+        }
+
+        return count;
     }
 
     private static void QueueOrUpdateEvent(
