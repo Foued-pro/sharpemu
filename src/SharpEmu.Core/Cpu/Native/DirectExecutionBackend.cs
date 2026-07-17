@@ -5039,7 +5039,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = CallNativeEntry(ptr);
+				var nativeReturn = RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5207,7 +5207,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ActiveGuestThreadYieldReason = null;
 			try
 			{
-				var nativeReturn = CallNativeEntry(ptr);
+				var nativeReturn = RunGuestEntryStub(ptr, hostRspSlot);
 				if (ActiveGuestThreadYieldRequested)
 				{
 					reason = ActiveGuestThreadYieldReason ?? "guest thread blocked";
@@ -5498,7 +5498,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			int num6 = -1;
 			try
 			{
-				num6 = CallNativeEntry(ptr);
+				num6 = RunGuestEntryStub(ptr, num2);
 				Console.Error.WriteLine($"[LOADER][INFO] Guest returned: {num6}");
 				PumpUntilGuestThreadsIdle(context, "entry_return");
 			}
