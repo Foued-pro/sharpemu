@@ -1,4 +1,4 @@
-# Ghost of Yōtei — boot vers le menu (branche fix/yotei-boot-deadlock)
+/# Ghost of Yōtei — boot vers le menu (branche fix/yotei-boot-deadlock)
 
 ## 2026-07-17 — Session en cours
 
@@ -277,9 +277,46 @@ du tableau réel (contrairement à la garbage précédente) ; les valeurs à 0
 crash systématique vers #25-32K avant), toujours en cours au moment de la
 rédaction, aucun fatal/AV. Prochain rapport après la fin du run en cours.
 
+### CLR fatal UnmanagedCallersOnly — CAUSE RACINE TROUVÉE (cherry-pick 45759b5)
+
+Relecture des derniers runs de la nuit (`log_yotei_longwatch1.txt`,
+`log_yotei_wercapture1.txt`, POSTÉRIEURS au fix primstate) : le fatal
+persistait, non déterministe vers l'import #31K, toujours sur la pile
+`ExecuteBlockedGuestThreadContinuation → CallNativeEntry`. Ce n'était donc
+PAS entièrement expliqué par dbOlWdppb4o.
+
+Cause : la branche `fix/yotei-boot-deadlock` n'a jamais reçu le commit
+**b87efce** (créé le 16 au soir sur `fix/quake-render-aliasing`,
+vérifié par `git branch --contains`) qui restaure dans le pré-filtre VEH
+natif (`WindowsFaultHandling.CreateHandlerThunk`) les deux protections
+silencieusement perdues par le port d'abstraction hôte 5629beb :
+1. le **check de plage RIP** (faute avec RIP ≥ 0x7FF0'00000000 = code
+   JIT/système → CONTINUE_SEARCH, jamais le handler managé) ;
+2. les 3 codes debug bénins (OutputDebugString ANSI/wide, SetThreadName).
+
+Sans le check RIP, une faute levée pendant que le thread est en mode GC
+coopératif entre dans le handler managé via le thunk reverse-P/Invoke →
+FailFast CLR « attempted to call a UnmanagedCallersOnly method from
+managed code » — la signature exacte observée. Mécanisme déjà documenté
+et prouvé sur Quake (mémoires `unmanagedcallersonly-fatal`,
+`quake-fault-trampoline-regression-fixed`).
+
+Fix : cherry-pick de b87efce → **45759b5** (mêmes 3 fichiers : codes +
+check RIP + test de régression direct du thunk émis). Build 0 erreur,
+tests trampoline 2/2 OK.
+
+Vérification : run `log_yotei_ripfix1.txt` — **#2 089 863 imports sans
+aucun fatal, process encore vivant** (arrêté manuellement) ; les deux runs
+précédents mouraient à ~#31K (×67 plus loin). État final du run : thread
+principal en trylock EBUSY (bénin), 3 queues compute suspendues sur des
+labels ==1 jamais écrits, zéro submit graphique, zéro flip.
+
 ### Hypothèses en attente (dans l'ordre)
 
-1. Mur suivant, à identifier une fois le run en cours terminé.
+1. Queues compute suspendues : 3× `agc.wait_suspended queue=acb.compute[N]
+   producer=none-observed` (WAIT_REG_MEM sur des labels que rien n'écrit,
+   cmp=3/ref=1) — aucun SubmitDcb graphique dans le run, donc pas d'EOP
+   writeback pour les produire. Probable prochain mur réel.
 2. create_shader type=5 (hull shader) : case `5 => lo=0x10A hi=0x10B` dans
    PatchShaderProgramRegisters — 6 échecs non fatals par run.
-3. AprWaitCommandBuffer id=-1.
+3. AprWaitCommandBuffer id=-1 (impl xnetcat à comparer).
