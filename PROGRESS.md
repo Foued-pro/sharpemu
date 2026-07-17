@@ -222,10 +222,64 @@ session — à reprendre séparément (probablement lié au cycle de threads
 audio ou de continuation de thread guest bloqué, à confirmer par capture
 du NID/nom de thread juste avant le fatal).
 
+### CLR fatal UnmanagedCallersOnly — hypothèse structurelle testée et écartée
+
+Tentative : reconnecter `RunGuestEntryStub`/`NativeGuestExecutor` (isolation
+sur threads OS natifs, code déjà présent dans
+`DirectExecutionBackend.NativeWorker.cs` avec commentaire décrivant EXACTEMENT
+ce crash, mais **zéro appelant** dans toute la base — mécanisme orphelin,
+jamais câblé). Câblé aux 3 sites d'appel direct de `CallNativeEntry`
+(`ExecuteGuestThreadEntry`, `ExecuteGuestContinuationEntry`,
+`ExecuteEntry`). Build OK, 160/160 tests Libs passent, Quake tourne 40s sans
+régression (0 fatal). **Mais le crash Yotei persiste identique** (même point,
+juste ~7000 imports plus tôt/tard selon le run — variance de timing, pas un
+changement réel). Hypothèse invalidée par le run → **reverté** (règle 3).
+
+Root cause réelle trouvée séparément (voir section suivante) : ce n'était
+PAS un problème d'isolation de thread, mais un import non résolu classique —
+la même famille de bug que `DcbJumpGetSize` et `FlipStatus`, pas une race
+de threading.
+
+### Import non résolu dbOlWdppb4o → AV lecture — RÉSOLU (à committer)
+
+Après le fix `DcbJumpGetSize`, le run avançait jusqu'à ~import #25-32K puis
+crashait de façon NON déterministe (parfois CLR fatal UnmanagedCallersOnly
+exit 6, parfois AV native exit 139) — signature classique de comportement
+indéfini déclenché par de la mémoire non initialisée, pas une vraie race.
+
+Désassemblage (décrypté eboot) : le crash AV (read à 0x80A790D40, dans une
+région réservée de 32 Go jamais committée) se produit dans une fonction
+générique de sondage de table de hachage (probing quadratique avec offsets
+-0xD4/-0x187) appelée depuis 0x8009F91FA avec `edx=0x20` (constante,
+PAS lue d'un header). Elle lit 32 paires (offset,valeur) depuis le buffer
+`[rbp-0x130]` et utilise le premier élément de chaque paire comme INDEX de
+tableau — un index issu d'octets de pile guest non initialisés produit un
+index absurde → lecture hors limites.
+
+Ce même buffer `[rbp-0x130]` est le `ucRegistersAddress` de
+`sceAgcCreatePrimState` (D9sr1xGUriE, DÉJÀ implémenté, écrit seulement les
+3 premières paires = 24 octets), immédiatement suivi d'un appel à
+**`dbOlWdppb4o`** avec le MÊME pointeur de base — confirmé non résolu dans
+le log (`Import#31017 unresolved: nid=dbOlWdppb4o`). Symbole réel non trouvé
+(absent de ps5_names.txt, brute-force hash infructueux sur ~230 candidats) ;
+implémenté sous le nom provisoire `sceAgcAddPrimStateRegisters` avec
+commentaire documentant la preuve.
+
+Fix : zéro-remplissage de `[rdi+24, rdi+0x100)` (les 29 paires que
+`CreatePrimState` ne remplit pas, dans la fenêtre exacte scannée par
+l'appelant), préservant les 3 premières paires déjà écrites par
+CreatePrimState. Justification : un index de sonde à 0 reste dans les limites
+du tableau réel (contrairement à la garbage précédente) ; les valeurs à 0
+échoueront simplement le test d'égalité du probe et seront ignorées comme
+"registre absent" — dégradation silencieuse acceptable, pas un crash.
+
+**Vérifié** : le run dépasse maintenant l'import **#226 511** (contre un
+crash systématique vers #25-32K avant), toujours en cours au moment de la
+rédaction, aucun fatal/AV. Prochain rapport après la fin du run en cours.
+
 ### Hypothèses en attente (dans l'ordre)
 
-1. CLR fatal UnmanagedCallersOnly (nouveau mur ci-dessus, prioritaire —
-   bloque toute progression au-delà du premier travail GPU réel).
+1. Mur suivant, à identifier une fois le run en cours terminé.
 2. create_shader type=5 (hull shader) : case `5 => lo=0x10A hi=0x10B` dans
    PatchShaderProgramRegisters — 6 échecs non fatals par run.
 3. AprWaitCommandBuffer id=-1.
