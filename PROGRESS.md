@@ -358,10 +358,34 @@ puis chunks ; >9 000 soumissions et ça continue), avec des waits par id
 exact qui réussissent. C'est la machine à états `all_shaders` (bloquée à
 2/6 depuis le 16) qui avance — l'ancien « compteur à 6 » de FaWorkerIo1.
 
+### Post-APR : les waits compute se résolvent, puis DEADLOCK présenteur (cec6bee)
+
+Run tracé SHARPEMU_LOG_AGC=1 (`log_yotei_agctrace1.txt`) : le DCB graphique
+(submission 6) contient `release_mem dst=0x2000000020 data=1` → notre wait
+registry résume `acb.compute[56]` (waited_ms=0,486) dont le payload ASCII
+se nomme **« Clear G-Buffer »** — le rendu de frame commence réellement.
+Les « 3 waits suspendus » des runs non tracés se résolvaient donc en
+silence (les resumes ne se loguent qu'avec LOG_AGC).
+
+La trace s'arrête net au premier DISPATCH compute (op=0x15). Dump du
+process vivant (`yotei_dispatch_stall.dmp`, pstacks) :
+- thread guest dans `DriverSubmitDcb` (tient gpuState.Gate) bloqué dans
+  `ObserveComputeDispatch → VulkanVideoPresenter.WaitForGuestWork →
+  Monitor.Wait` ;
+- GPU-wait monitor + 2 callbacks `SubmitOrderedGpuSideEffect` en
+  `Monitor.Enter` sur le même gate ;
+- **aucun thread présenteur Vulkan vivant**.
+
+Cause : `SubmitComputeDispatch` enfile du travail et retourne une séquence
+même sans consommateur ; seuls les chemins DRAW démarraient le présenteur.
+Yotei fait du compute avant tout draw/VideoOut → attente infinie sous le
+gate → pipeline entier gelé (c'était le vrai mur « jamais de flip »).
+Fix cec6bee : démarrer le présenteur depuis le chemin compute, comme les
+chemins draw (Run() a déjà un fallback de taille de fenêtre).
+
 ### Hypothèses en attente (dans l'ordre)
 
-1. Fin du streaming all_shaders → observer si create_shader/graphics
-   submits/flips démarrent (run en cours).
-2. Queues compute suspendues : 3× `agc.wait_suspended` sur labels ==1
-   jamais écrits (submissions 3/4/5 tôt au boot) — producteur probable =
-   queue graphique pas encore soumise, à revérifier après le déblocage.
+1. Run avec fix présenteur en cours : guetter `presented guest frame` /
+   premier flip → LE MENU.
+2. Si le rendu sort noir : shaders Pulse (UI) à vérifier (type=5 hull
+   passent désormais).
