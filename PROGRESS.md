@@ -383,9 +383,31 @@ gate → pipeline entier gelé (c'était le vrai mur « jamais de flip »).
 Fix cec6bee : démarrer le présenteur depuis le chemin compute, comme les
 chemins draw (Run() a déjà un fallback de taille de fenêtre).
 
+### PREMIÈRE FRAME PRÉSENTÉE (aca2bf4) 🎉
+
+Avec le présenteur démarré, le jeu a atteint l'enregistrement des display
+buffers : `sceVideoOutRegisterBuffers2` (rKBUtgRrtbk, résolu par hash) et
+`sceVideoOutUnregisterBuffers` (N5KDtkIjjJ4) échouaient en INVALID_VALUE —
+notre impl rejetait `category != 0` ; Yotei passe **category=1** (3 sets de
+2 buffers 3840x2160). Fix aca2bf4 : catégorie inconnue acceptée + tracée.
+
+Résultat (`log_yotei_regbuf1.txt`) :
+```
+Vulkan VideoOut presented splash: 3840x2160
+Vulkan VideoOut presented first frame: 3840x2160
+```
+**Première présentation de frame de l'histoire de ce titre sur SharpEmu.**
+Fenêtre ouverte ("SharpEmu - Ghost of Yotei [PPSA26344] v01.008.000"),
+contenu encore blanc (screenshot yotei_window2.png) — le contenu 4K du
+display buffer n'est pas encore traduit/composé, et une seule frame
+présentée pour l'instant ; le jeu continue de travailler derrière
+(imports diversifiés, plus de régime figé).
+
 ### Hypothèses en attente (dans l'ordre)
 
-1. Run avec fix présenteur en cours : guetter `presented guest frame` /
-   premier flip → LE MENU.
-2. Si le rendu sort noir : shaders Pulse (UI) à vérifier (type=5 hull
-   passent désormais).
+1. Contenu blanc : vérifier la traduction du display buffer 4K category=1
+   (compression ? le rendu écrit-il dans les buffers enregistrés ?) et
+   pourquoi une seule présentation (attente vblank/flip suivant ?).
+2. Les waits compute restants (labels 0x2011831650/0x2011669FE0/0x2000000480)
+   — vérifier s'ils se résolvent maintenant que graphics submits + flips
+   existent.
