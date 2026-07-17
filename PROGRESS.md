@@ -427,6 +427,17 @@ peut-être un vrai début de contenu (logo pas encore dessiné dessus).
    rdx=info* out, r8=0x40). L'implémenter dans
    NpEntitlementAccessExports.cs à côté de GetAddcontEntitlementInfoList —
    trouver le bon code d'erreur « non possédé » avant (ne pas improviser).
-4. Trylock EBUSY permanent (mutex via handles en pile, rcx=0x801B458D0,
-   2 threads audio) : identifier le détenteur avec SHARPEMU_LOG_PTHREADS=1
-   si l'audio gate la suite.
+4. ~~Trylock EBUSY permanent~~ **ÉLIMINÉ** (run `log_yotei_pthreads1.txt`,
+   SHARPEMU_LOG_PTHREADS=1) : le spinner est **ScreamWorker1** (mixeur
+   audio, host_priority=Highest) qui polle en trylock-or-skip les buffers
+   gardés par `snd_stream_parsing_thread`/`snd_stream_reader_thread` —
+   motif normal de mixeur temps réel, propriétaires vivants qui alternent,
+   pas un deadlock, pas le gate frame-2. Anomalie mineure relevée au
+   passage : 5 trylocks EBUSY avec owner=0/recursion=0 (la file FIFO
+   stricte refuse un mutex LIBRE parce que réservé par un waiter) — un
+   vrai scePthreadMutexTrylock réussirait ; à corriger si un titre s'y
+   coince un jour.
+
+Note : le run record (133M imports) s'est terminé proprement par la
+fermeture de la fenêtre (`videoout-window-closed`, requested=False —
+clic extérieur), pas par un crash.
