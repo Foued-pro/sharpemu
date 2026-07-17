@@ -403,11 +403,30 @@ display buffer n'est pas encore traduit/composé, et une seule frame
 présentée pour l'instant ; le jeu continue de travailler derrière
 (imports diversifiés, plus de régime figé).
 
+### État fin de session (run `log_yotei_regbuf1.txt` laissé vivant)
+
+Le run dépasse **#7 000 000 d'imports** (ancien record : 3,69M tué par le
+garde anti-boucle ; celui-ci vit car l'activité est diversifiée). 33 threads
+guest nommés (MovieDecoder, FaWorkerIo1, JobWorker×20, Scream, snd_stream…),
+2 présentations (splash + first frame 3840x2160), fenêtre blanche stable.
+Nota : l'écran logo Sucker Punch est à fond blanc — le « blanc » est
+peut-être un vrai début de contenu (logo pas encore dessiné dessus).
+
 ### Hypothèses en attente (dans l'ordre)
 
-1. Contenu blanc : vérifier la traduction du display buffer 4K category=1
-   (compression ? le rendu écrit-il dans les buffers enregistrés ?) et
-   pourquoi une seule présentation (attente vblank/flip suivant ?).
-2. Les waits compute restants (labels 0x2011831650/0x2011669FE0/0x2000000480)
-   — vérifier s'ils se résolvent maintenant que graphics submits + flips
-   existent.
+1. Frame 2 : une seule présentation puis plus rien — même classe que les
+   stalls « frame 2 » Doom/Quake. Vérifier ce que le jeu attend entre la
+   frame 1 et la frame 2 (event flip/vblank sur equeue ? MovieDecoder ?).
+   Piste : tracer les WaitEqueue + events VideoOut sur un run dédié.
+2. Contenu blanc : traduction du display buffer 4K category=1
+   (compression ?) — le rendu écrit-il vraiment dans les buffers
+   enregistrés ?
+3. `xddD23+8TfQ` = sceNpEntitlementAccessGetAddcontEntitlementInfo
+   (résolu par hash, PAS encore implémenté) : le jeu re-boucle dessus
+   périodiquement (probing DLC, args : rdi=serviceLabel=0, rsi=label ptr,
+   rdx=info* out, r8=0x40). L'implémenter dans
+   NpEntitlementAccessExports.cs à côté de GetAddcontEntitlementInfoList —
+   trouver le bon code d'erreur « non possédé » avant (ne pas improviser).
+4. Trylock EBUSY permanent (mutex via handles en pile, rcx=0x801B458D0,
+   2 threads audio) : identifier le détenteur avec SHARPEMU_LOG_PTHREADS=1
+   si l'audio gate la suite.
