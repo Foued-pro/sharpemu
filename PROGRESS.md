@@ -311,12 +311,57 @@ précédents mouraient à ~#31K (×67 plus loin). État final du run : thread
 principal en trylock EBUSY (bénin), 3 queues compute suspendues sur des
 labels ==1 jamais écrits, zéro submit graphique, zéro flip.
 
+### CORRECTIF au diagnostic UCO : le check RIP ne suffisait pas
+
+Run suivant (`log_yotei_batch2.txt`) : fatal identique à #33K AVEC le check
+RIP en place. Le run à 2M était de la chance (crash non déterministe ;
+primstate1 avait atteint 1,8M sans le fix non plus). Le check RIP reste
+correct (prouvé sur Quake) mais ne couvre pas la cause Yotei.
+
+**Vraie cause + fix (de6903f)** : tous les stubs guest s'exécutaient inline
+sur des threads CLR via `CallNativeEntry` — frames guest sans unwind info
+CLR empilées au-dessus de frames managées ; toute fenêtre où la comptabilité
+de mode de thread diverge de la pile réelle fail-fast le runtime (mécanisme
+décrit noir sur blanc dans l'en-tête de DirectExecutionBackend.NativeWorker.cs).
+Le pool `NativeGuestExecutor` (threads OS bruts, zéro frame managée sous le
+guest) existait, complet, avec **zéro appelant**. Câblé aux 3 sites
+(`RunGuestEntryStub`). La session précédente avait testé ce câblage et
+conclu « inefficace » — mais AVANT le fix dbOlWdppb4o dont l'UB produisait
+la même signature de fatal : verdict contaminé, retesté proprement.
+Vérif : **3/3 runs franchissent la fenêtre #31-33K** (>160K imports, 0 fatal)
+contre crash immédiat à #33K sans le câblage. 162/162 tests Libs OK.
+Kill switch : `SHARPEMU_DISABLE_NATIVE_GUEST_WORKERS=1`.
+
+### Batch de NIDs résolus par hash (dfdb338)
+
+Les 14 imports non résolus du run passés au hash NID contre ps5_names.txt :
+- **BIPexNBSGog = sceAgcDcbCondExec** → implémenté (paquet IT_COND_EXEC réel,
+  0x22 ; le walker saute les ops inconnus → prédicat toujours-vrai, dégradation
+  sûre).
+- **tU5e3f9gSiU = sceKernelIsTrinityMode**, **BfBDZGbti7A =
+  sceAgcGetIsTrinityMode** (détection PS5 Pro) → répondent « non ».
+- create_shader type=5 (hull) : case 5 => 0x10A/0x10B ajouté.
+- Restants tolérés : scePsmlMfsrInit/GetSharedResourcesInitRequirement
+  (upscaler PSSR — 3 autres NIDs MFSR déjà stubés NOT_FOUND par f0c8603),
+  sceNpRegisterNpReachabilityStateCallback, sceNpSessionSignalingCreateContext2,
+  sceHttpSetConnectTimeOut, sceNetGetMacAddress, sceNpTrophy2GetTrophyInfoArray,
+  sceGameLiveStreamingInitialize, sceKernelGetOpenPsId,
+  sceNpEntitlementAccessGetSkuFlag/GetAddcontEntitlementInfo (le ×9).
+
+### PERCÉE : sceKernelAprWaitCommandBuffer(-1) débloquait all_shaders (13f08c3)
+
+`id=-1` (wait-all) retournait NOT_FOUND ; nos soumissions APR se complètent
+de façon synchrone au submit → wait-all = succès immédiat. Résultat mesuré
+(`log_yotei_aprfix1.txt`, SHARPEMU_LOG_AMPR=1) : le jeu **streame
+`cache_ps5/all_shaders.xpps` par MILLIERS de soumissions APR** (header 0x58,
+puis chunks ; >9 000 soumissions et ça continue), avec des waits par id
+exact qui réussissent. C'est la machine à états `all_shaders` (bloquée à
+2/6 depuis le 16) qui avance — l'ancien « compteur à 6 » de FaWorkerIo1.
+
 ### Hypothèses en attente (dans l'ordre)
 
-1. Queues compute suspendues : 3× `agc.wait_suspended queue=acb.compute[N]
-   producer=none-observed` (WAIT_REG_MEM sur des labels que rien n'écrit,
-   cmp=3/ref=1) — aucun SubmitDcb graphique dans le run, donc pas d'EOP
-   writeback pour les produire. Probable prochain mur réel.
-2. create_shader type=5 (hull shader) : case `5 => lo=0x10A hi=0x10B` dans
-   PatchShaderProgramRegisters — 6 échecs non fatals par run.
-3. AprWaitCommandBuffer id=-1 (impl xnetcat à comparer).
+1. Fin du streaming all_shaders → observer si create_shader/graphics
+   submits/flips démarrent (run en cours).
+2. Queues compute suspendues : 3× `agc.wait_suspended` sur labels ==1
+   jamais écrits (submissions 3/4/5 tôt au boot) — producteur probable =
+   queue graphique pas encore soumise, à revérifier après le déblocage.
