@@ -69,10 +69,9 @@ internal static partial class Program
         }
 
         args = NormalizeInternalArguments(args, out var isMitigatedChild);
-        if (args.Length == 0 && !isMitigatedChild)
+
+        if (args.Length == 0)
         {
-            // No arguments: open the desktop frontend. Any argument selects
-            // the classic CLI behavior below.
             return GuiLauncher.Run();
         }
 
@@ -228,7 +227,17 @@ internal static partial class Program
             return childExitCode;
         }
 
-        if (!TryParseArguments(args, out var ebootPath, out var runtimeOptions, out var logLevel, out var logFilePath))
+        if (!TryExtractHostSurfaceArgument(args, out var emulatorArgs, out var hostSurface, out var hostSurfaceError))
+        {
+            Console.Error.WriteLine($"[LOADER][ERROR] {hostSurfaceError}");
+            return 1;
+        }
+
+        HostSessionControl.SetEmbeddedHostSurface(
+            hostSurface?.WindowHandle ?? 0,
+            hostSurface?.DisplayHandle ?? 0);
+
+        if (!TryParseArguments(emulatorArgs, out var ebootPath, out var runtimeOptions, out var logLevel, out var logFilePath))
         {
             PrintUsage();
             return 1;
@@ -253,68 +262,156 @@ internal static partial class Program
             return 2;
         }
 
-        Console.Error.WriteLine("[DEBUG] Creating runtime...");
-
-        using var runtime = SharpEmuRuntime.CreateDefault(runtimeOptions);
-
-        OrbisGen2Result result;
-        ConsoleCancelEventHandler? cancelHandler = null;
-        try
+        if (!TryGetDebugServerOptions(args, out var debugServerEnabled, out var debugServerOptions, out var debugServerError))
         {
-            cancelHandler = (_, eventArgs) =>
-            {
-                eventArgs.Cancel = true;
-                VideoOutExports.NotifyHostInterrupt();
-            };
-            Console.CancelKeyPress += cancelHandler;
-
-            Console.Error.WriteLine($"[DEBUG] Running: {ebootPath}");
-            result = runtime.Run(ebootPath);
-            Console.Error.WriteLine($"[DEBUG] Result: {result}");
+            Log.Error($"Invalid --debug-server endpoint: {debugServerError}");
+            return 1;
         }
-        catch (Exception ex)
+
+        SharpEmu.Debugger.DebuggerServerHost? debugHost = null;
+        if (debugServerEnabled)
         {
-            Console.Error.WriteLine($"[DEBUG] Exception: {ex}");
-            Log.Error("SharpEmu failed to run.", ex);
-            return 3;
-        }
-        finally
-        {
-            if (cancelHandler is not null)
+            debugHost = new SharpEmu.Debugger.DebuggerServerHost(debugServerOptions);
+            try
             {
-                Console.CancelKeyPress -= cancelHandler;
+                debugHost.Start();
+                Log.Info($"Live debug server listening on {debugHost.Endpoint}. Attach with SharpEmu.DebugClient.");
+                // With StopAtEntry, the guest parks at its first frame until a
+                // client connects and continues.
+                runtimeOptions = runtimeOptions with { DebugHook = debugHost.Hook };
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Failed to start the debug server.", ex);
+                debugHost.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                return 6;
             }
         }
 
-        Log.Info($"SharpEmu execution completed. Result={result} (0x{(int)result:X8})");
-        if (!string.IsNullOrWhiteSpace(runtime.LastSessionSummary))
+        Console.Error.WriteLine("[DEBUG] Creating runtime...");
+
+        try
         {
-            Log.Info(runtime.LastSessionSummary);
+            if (hostSurface is not null && !VulkanVideoHost.TryAttachSurface(hostSurface))
+            {
+                Console.Error.WriteLine("[LOADER][ERROR] The requested GUI host surface is already active.");
+                return 3;
+            }
+
+            using var runtime = SharpEmuRuntime.CreateDefault(runtimeOptions);
+
+            OrbisGen2Result result;
+            ConsoleCancelEventHandler? cancelHandler = null;
+            try
+            {
+                cancelHandler = (_, eventArgs) =>
+                {
+                    eventArgs.Cancel = true;
+                    VideoOutExports.NotifyHostInterrupt();
+                };
+                Console.CancelKeyPress += cancelHandler;
+
+                Console.Error.WriteLine($"[DEBUG] Running: {ebootPath}");
+                result = runtime.Run(ebootPath);
+                Console.Error.WriteLine($"[DEBUG] Result: {result}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[DEBUG] Exception: {ex}");
+                Log.Error("SharpEmu failed to run.", ex);
+                return 3;
+            }
+            finally
+            {
+                if (cancelHandler is not null)
+                {
+                    Console.CancelKeyPress -= cancelHandler;
+                }
+            }
+
+            Log.Info($"SharpEmu execution completed. Result={result} (0x{(int)result:X8})");
+            if (!string.IsNullOrWhiteSpace(runtime.LastSessionSummary))
+            {
+                Log.Info(runtime.LastSessionSummary);
+            }
+
+            if (!string.IsNullOrWhiteSpace(runtime.LastBasicBlockTrace))
+            {
+                Log.Info("BB trace:");
+                Log.Info(runtime.LastBasicBlockTrace);
+            }
+
+            if (!string.IsNullOrWhiteSpace(runtime.LastMilestoneLog))
+            {
+                Log.Info(runtime.LastMilestoneLog);
+            }
+
+            if (result != OrbisGen2Result.ORBIS_GEN2_OK && !string.IsNullOrWhiteSpace(runtime.LastExecutionDiagnostics))
+            {
+                Log.Warn(runtime.LastExecutionDiagnostics);
+            }
+
+            if (runtimeOptions.ImportTraceLimit > 0 && !string.IsNullOrWhiteSpace(runtime.LastExecutionTrace))
+            {
+                Log.Info("Import trace:");
+                Log.Info(runtime.LastExecutionTrace);
+            }
+
+            return result == OrbisGen2Result.ORBIS_GEN2_OK ? 0 : 4;
+        }
+        finally
+        {
+            if (debugHost is not null)
+            {
+                debugHost.NotifyRunCompleted();
+                debugHost.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }
+
+            HostSessionControl.SetEmbeddedHostSurface(0);
+            if (hostSurface is not null)
+            {
+                VulkanVideoHost.RequestClose();
+                VulkanVideoHost.DetachSurface(hostSurface);
+                hostSurface.Dispose();
+            }
+        }
+    }
+
+    private static bool TryExtractHostSurfaceArgument(
+        IReadOnlyList<string> args,
+        out string[] emulatorArgs,
+        out VulkanHostSurface? hostSurface,
+        out string? error)
+    {
+        const string hostSurfacePrefix = "--host-surface=";
+        var remaining = new List<string>(args.Count);
+        hostSurface = null;
+        error = null;
+        foreach (var argument in args)
+        {
+            if (!argument.StartsWith(hostSurfacePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                remaining.Add(argument);
+                continue;
+            }
+
+            if (hostSurface is not null)
+            {
+                emulatorArgs = [];
+                error = "more than one GUI host surface was specified";
+                return false;
+            }
+
+            var descriptor = argument[hostSurfacePrefix.Length..];
+            if (!VulkanHostSurface.TryCreateChildProcessSurface(descriptor, out hostSurface, out error))
+            {
+                emulatorArgs = [];
+                return false;
+            }
         }
 
-        if (!string.IsNullOrWhiteSpace(runtime.LastBasicBlockTrace))
-        {
-            Log.Info("BB trace:");
-            Log.Info(runtime.LastBasicBlockTrace);
-        }
-
-        if (!string.IsNullOrWhiteSpace(runtime.LastMilestoneLog))
-        {
-            Log.Info(runtime.LastMilestoneLog);
-        }
-
-        if (result != OrbisGen2Result.ORBIS_GEN2_OK && !string.IsNullOrWhiteSpace(runtime.LastExecutionDiagnostics))
-        {
-            Log.Warn(runtime.LastExecutionDiagnostics);
-        }
-
-        if (runtimeOptions.ImportTraceLimit > 0 && !string.IsNullOrWhiteSpace(runtime.LastExecutionTrace))
-        {
-            Log.Info("Import trace:");
-            Log.Info(runtime.LastExecutionTrace);
-        }
-
-        return result == OrbisGen2Result.ORBIS_GEN2_OK ? 0 : 4;
+        emulatorArgs = remaining.ToArray();
+        return true;
     }
 
     private static void EnsureCliConsole()
@@ -411,7 +508,9 @@ internal static partial class Program
         return handle != 0 && handle != -1;
     }
 
-    private static string[] NormalizeInternalArguments(string[] args, out bool isMitigatedChild)
+    private static string[] NormalizeInternalArguments(
+        string[] args,
+        out bool isMitigatedChild)
     {
         isMitigatedChild = false;
         var trustedMitigatedChild = string.Equals(
@@ -931,8 +1030,45 @@ internal static partial class Program
 
     private static void PrintUsage()
     {
-        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] [--log-file[=<path>]] <path-to-eboot.bin>");
+        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] [--log-file[=<path>]] [--debug-server[=host:port]] <path-to-eboot.bin>");
         Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug --log-file ""E:\Games\...\eboot.bin""");
+        Log.Info("Debug server: --debug-server starts a live debug listener (default 127.0.0.1:5714); connect with SharpEmu.DebugClient.");
+    }
+
+    /// <summary>
+    /// Detects the <c>--debug-server</c> flag and parses its optional
+    /// <c>host:port</c> endpoint. Returns false only when the flag is present but
+    /// its endpoint is malformed, so the caller can abort with a clear error.
+    /// </summary>
+    private static bool TryGetDebugServerOptions(
+        string[] args,
+        out bool enabled,
+        out SharpEmu.Debugger.Server.DebuggerServerOptions options,
+        out string error)
+    {
+        enabled = false;
+        options = new SharpEmu.Debugger.Server.DebuggerServerOptions();
+        error = string.Empty;
+        foreach (var argument in args)
+        {
+            if (string.Equals(argument, "--debug-server", StringComparison.OrdinalIgnoreCase))
+            {
+                enabled = true;
+                continue;
+            }
+
+            const string prefix = "--debug-server=";
+            if (argument.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                enabled = true;
+                if (!SharpEmu.Debugger.Server.DebuggerServerOptions.TryParseEndpoint(argument[prefix.Length..], out options, out error))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     private static bool TryParseArguments(
@@ -963,6 +1099,15 @@ internal static partial class Program
             if (string.Equals(argument, "--strict", StringComparison.OrdinalIgnoreCase))
             {
                 strictDynlibResolution = true;
+                continue;
+            }
+
+            // The debug-server endpoint is parsed separately (see
+            // TryGetDebugServerOptions); accept the flag here so it is not
+            // rejected as an unknown option or mistaken for the eboot path.
+            if (string.Equals(argument, "--debug-server", StringComparison.OrdinalIgnoreCase) ||
+                argument.StartsWith("--debug-server=", StringComparison.OrdinalIgnoreCase))
+            {
                 continue;
             }
 

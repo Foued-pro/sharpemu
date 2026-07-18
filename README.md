@@ -27,7 +27,9 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 > [!NOTE]  
 > SharpEmu supports Windows x64, Linux x64, and macOS x64. Apple Silicon Macs
-> can run the macOS x64 build through Rosetta 2.
+> can run the macOS x64 build through Rosetta 2, and Windows on ARM devices
+> (e.g. Snapdragon) can run the Windows x64 build through Windows' built-in
+> x64 emulation.
 
 > [!WARNING]  
 > SharpEmu is an experimental PS5 emulator developed from scratch in C#. The current focus is on accuracy and infrastructure setup rather than game-specific compatibility.
@@ -40,6 +42,16 @@ This project is developed purely for research and educational purposes. There ar
 
 SharpEmu focuses exclusively on the PlayStation 5.  
 Our goal is **not** to emulate PS4 games, as there is already an excellent emulator dedicated to that platform: **ShadPS4**.
+
+## Games Tested
+
+|               Demons Souls Remake                   |                     Dreaming Sarah                         |
+| :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
+| ![Bloodborne screenshot](./.github/images/demons-souls.jpg) | ![Dreaming Sarah](./.github/images/dreaming-sarah.jpg) |
+
+|                  Void Terrarium                     |                 Dead Cells                    |
+| :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
+| ![Void Terrarium](./.github/images/void-terrarium.jpg) | ![Dead Cells](./.github/images/dead-cells.jpg) |
 
 ## Status
 
@@ -87,25 +99,6 @@ chmod +x ./SharpEmu
 
 A Vulkan-capable GPU and current graphics driver are required. The macOS
 release includes the MoltenVK Vulkan implementation.
-
-## Games Tested
-
-* **Demon's Souls Remake**
-  * [Demon's Souls [PPSA01341]](https://github.com/sharpemu/sharpemu/issues/2)
-  * Demon's Souls is now video loop. Shaders are ready to be converted to SPIR-V/Vulkan. We are continuing our work on this.
-  ![DeS videoOut submit first frame](./.github/images/des-videoout-shaders.jpg)
-
-* **Poppy Playtime Chapter 1**
-  * [Poppy Playtime Chapter 1 [PPSA20591]](https://github.com/sharpemu/sharpemu/issues/3)
-
-* **SILENT HILL: The Short Message**
-  * [SILENT HILL: The Short Message [PPSA10112]](https://github.com/sharpemu/sharpemu/issues/4)
-
-* **Dreaming Sarah**
-  * [Dreaming Sarah [PPSA02929]](https://github.com/sharpemu/sharpemu/issues/9)
-  * Real texture rendering for this game;
-  ![Splash texture](./.github/images/dreaming-sarah.jpg)
-
 
 > [!IMPORTANT]  
 > This project does **not** support or condone piracy.  

@@ -237,6 +237,17 @@ public sealed record Gen5SdwaControl(
     bool Clamp,
     uint? ScalarDestination) : Gen5InstructionControl;
 
+// Packed (VOP3P) source and destination modifiers. Each mask holds one bit per
+// source operand. OpSel/OpSelHi pick which 16-bit half of a source feeds the low
+// and high result lanes respectively; NegLo/NegHi negate the value routed to each
+// lane. Clamp saturates each output half to [0, 1].
+public sealed record Gen5Vop3pControl(
+    uint OpSelMask,
+    uint OpSelHiMask,
+    uint NegLoMask,
+    uint NegHiMask,
+    bool Clamp) : Gen5InstructionControl;
+
 public sealed record Gen5DppControl(
     uint Control,
     bool FetchInactive,
@@ -325,8 +336,30 @@ public sealed record Gen5ShaderProgram(
     ulong Address,
     IReadOnlyList<Gen5ShaderInstruction> Instructions)
 {
+    private const uint PixelColorTargetCount = 8;
+    private const int PixelColorMaskBits = 4;
+    private readonly uint _pixelColorExportMasks = ComputePixelColorExportMasks(Instructions);
     private const int ScalarRegisterCount = 256;
     private IReadOnlySet<uint>? _runtimeScalarRegisters;
+
+    public uint PixelColorExportMasks => _pixelColorExportMasks;
+
+    private static uint ComputePixelColorExportMasks(
+        IReadOnlyList<Gen5ShaderInstruction> instructions)
+    {
+        var masks = 0u;
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Control is Gen5ExportControl export &&
+                export.Target < PixelColorTargetCount)
+            {
+                masks |= (export.EnableMask & 0xFu) <<
+                    (int)(export.Target * PixelColorMaskBits);
+            }
+        }
+
+        return masks;
+    }
 
     public IEnumerable<Gen5ImageControl> ImageResources =>
         Instructions
