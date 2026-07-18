@@ -1695,3 +1695,97 @@ qword par header, ~90 headers — négligeable).
 - Cadence : ~12-20 s/frame en régime chaud. Leviers connus : drain
   événementiel (remplacer le tick 1-16 ms), traductions shader à froid
   (8 s observées sur un gros CS 4K).
+
+## 2026-07-19 — Mur des fins de chunks corrigé + nouveau mur trouvé (enregistrement du jeu s'arrête)
+
+### Fix : étendue réellement parsée, pas la taille de fenêtre déclarée (commit c810f1e)
+
+Root cause exacte du "compteurs en retard" de la session précédente :
+`RecordGameSubmittedRange(commandAddress, dwordCount)` était appelé dès
+la décision de suivre un chunk (avec la taille COMPLÈTE du chunk,
+16384 dwords), AVANT même de le parser. Si ce chunk suspendait en
+cours de route (WAIT_REG_MEM au milieu), le RESTE du chunk restait
+marqué « couvert par le jeu » pour toujours, affamant le sweep
+orphelin de paquets que la queue du jeu ne rattrapait jamais dans
+cette forme exacte.
+
+Fix : nouveau champ `SubmittedDcbState.LastParsedAddress`, mis à jour
+uniquement une fois les effets d'un paquet réellement exécutés (donc
+correct à tout point de suspension/échec). `ParseSubmittedDcb`
+enregistre désormais l'étendue VRAIMENT consommée après chaque
+fenêtre, pas la taille déclarée/du chunk. `RecordGameSubmittedRange`
+ne fait que grandir (déjà le cas), donc une ré-entrée ultérieure dans
+le même chunk accumule correctement.
+
+### Effet de bord découvert et corrigé : flip en double via la queue orpheline
+
+Cette précision accrue rouvrait une race que la revendication large
+masquait accidentellement : le sweep permanent (ajouté session
+précédente) pouvait atteindre un paquet SetFlip physiquement partagé
+avec le vrai ring graphique (le builder 0x804F171A0 EST le builder du
+ring graphique) avant que `dcb.graphics` n'y arrive lui-même — flip
+présenté deux fois, une fois via `acb.orphan_preamble[...]`. Fix :
+`SubmitFlipFromAgc` ne s'exécute que si `!state.IsForceSubmittedRing`
+— une queue orpheline ne peut plus jamais déclencher de présentation ;
+la vraie queue réexécute toujours le même paquet plus tard. Vérifié
+propre sur 2 runs de 300 s (zéro fatal, zéro frame dupliquée
+présentée).
+
+**Risque résiduel documenté, non fermé** : les paquets à effet de bord
+NON-flip (write_data increment=True, draws) atteints par le chemin
+orphelin avant que la vraie queue n'y arrive peuvent en théorie encore
+s'exécuter deux fois. Pas de corruption visible observée sur ces runs ;
+fenêtre réduite par le fix ci-dessus mais pas fermée structurellement.
+
+### NOUVEAU MUR (non résolu) : l'enregistrement du jeu s'arrête net après ~5-6 flips
+
+Run de 600 s (`log_yotei_long_1.txt`) : 5 flips présentés proprement
+(t=15,9 → 155,7 s), PUIS plus AUCUN nouveau `cb_release_mem` /
+`cmd_alloc_full` / `driver_submit_*_call` pendant les ~440 s restantes
+— **le thread d'enregistrement CPU du jeu s'arrête complètement**,
+contrairement au mur précédent (« frame-6 ») qui était résolu par le
+sweep permanent. Zéro wait GPU non résolu à la fin ; ce n'est donc pas
+un problème GPU/orphelin.
+
+**Séquence exacte trouvée juste après le dernier `driver_submit_dcb_call`
+(t=155,652, ~Import#2,85M-3,04M)** :
+1. Le MÊME mutex (`rdi=0x000000080520BAA8`, NID `9UK1vLZQft4` =
+   `scePthreadMutexLock`) reçoit `ORBIS_GEN2_ERROR_DEADLOCK` — ce qui
+   est déjà arrivé 5 FOIS SANS incident plus tôt dans le même run
+   (Import#26839/1536681/1943153/2264355/2546376), toujours depuis le
+   MÊME site d'appel (`ret=0x800E2363C`) — un probe normal et bénin.
+2. Mais ici, **3 sites d'appel DIFFÉRENTS** (`0x800E22486`,
+   `0x800E232BB`, `0x800E22F5C`) échouent sur ce même mutex coup sur
+   coup, suivis d'un 4e (`0x800E240C1`) juste avant le crash — jamais
+   observé ce cluster ailleurs dans le run.
+3. `__stack_chk_fail` (canari de pile corrompu) sur un thread invité,
+   NID `Ou3iL1abvng` (ORBIS_GEN2_ERROR_CPU_TRAP), qui termine cette
+   entrée invité (« Guest entry exit ... Guest returned:
+   -1535121536 »).
+4. Après ça : plus aucune activité AGC de tout le run, alors que les
+   imports (mutex trylock, `sceAudioOut2*`) continuent de grimper
+   normalement (9,66M au final) — le process est VIVANT, pas planté ;
+   c'est un thread/job précis (probablement celui qui enregistrait la
+   frame suivante) qui a été perdu silencieusement.
+
+**Hypothèse de travail, non vérifiée** : `KernelPthreadState.GetCurrentThreadHandle()`
+utilise correctement `GuestThreadExecution.CurrentGuestThreadHandle`
+(l'ambient rebindé par thread par `NativeGuestExecutor.EnterRun/ExitRun`),
+donc la piste « pool de threads OS confond l'ownership du mutex entre
+deux threads invités logiques différents » semble a priori exclue —
+mais pas vérifiée en profondeur. Piste alternative : un thread garde
+ce mutex verrouillé anormalement longtemps (assez pour que plusieurs
+sous-systèmes différents le sondent simultanément et heurtent la
+détection deadlock), possiblement exacerbé par le travail CPU
+supplémentaire du sweep permanent sur cette branche. À investiguer :
+identifier ce que représente le mutex 0x80520BAA8 (probablement lié au
+JobManager ou à un gestionnaire de ressources partagé), et pourquoi
+CE thread spécifique corrompt sa pile en gérant l'erreur — bug
+d'émulation (mauvaise valeur de retour/mauvais layout de pile dans
+notre stub) ou bug du jeu authentique déclenché par un timing que le
+vrai hardware n'atteint jamais.
+
+Prochaine étape naturelle : capturer un dump ciblé au moment précis de
+ce crash (import range 2,85M-3,05M), ou tracer les locks/unlocks de ce
+mutex spécifique sur toute la fenêtre pour voir qui le détient quand
+le cluster de 3 échecs survient.
