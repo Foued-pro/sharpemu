@@ -1585,3 +1585,65 @@ Run de validation (240 s, exit 124, zéro crash) :
 - Run de contrôle tiering PAR DÉFAUT lancé en fin de session pour
   savoir si TieredCompilation=0 est réellement indispensable au fix
   (résultat non encore connu à l'écriture de cette note).
+
+## 2026-07-18 (12e session, suite) — CYCLE DE FRAMES CONTINU : 5 flips présentés
+
+### Mesure : timestamps t= sur toutes les traces AGC
+
+Les chaînes de dépendances série s'étendent sur des dizaines de
+secondes ; sans timing par ligne, impossible d'attribuer la latence
+(production du jeu vs re-soumission émulateur). Constat immédiat : le
+paquet producteur d'un kick attendu 48 s était CONSTRUIT à t=3,5 —
+toute la latence était de notre côté.
+
+### Trois bugs de la machinerie orpheline, corrigés (commit 0f077e8)
+
+1. **Cycle de vie des arènes de builder** : les builders alternent
+   entre arènes par frame (frame N et N+2 partagent la même). (a) Un
+   changement d'arène entre deux drains du moniteur orphelinait
+   définitivement la fin non soumise de l'arène sortante — qui
+   contenait les seuls producteurs des kicks de la frame suivante.
+   (b) Un builder revenant sur une arène déjà vue (même base, curseur
+   RÉGRESSÉ) était lu comme « pas de nouveau contenu ». Fix :
+   snapshot du header à chaque sceAgcCbReleaseMem ; changement de
+   base → la tranche restante de l'arène fermée est mise en file pour
+   le prochain drain (les rings ne sont jamais remis à zéro, le
+   contenu reste valide) ; régression de curseur → restart de la
+   tranche depuis la base.
+2. **« Unreadable at trigger time » = transitoire, pas permanent** :
+   le builder 0x806AB69D0, déclenché avant sa construction, était
+   empoisonné (0,0) au boot puis détenait les seuls producteurs de la
+   frame 3. Loggé une fois, reste éligible.
+3. **Deux classes de builder acceptées** : recensement live de tous
+   les callbacks cmd_alloc_full → deux vtables (graphics 0x8009F5750,
+   utilisée AUSSI par le vrai builder du ring graphique ; compute
+   0x800AB4550). Le gate mono-vtable n'a jamais été la vraie
+   protection anti-double-submit (c'est le check d'alias des plages
+   game-submitted) ; il ne doit exclure que les objets étrangers.
+
+### Identité mémoire canonique (même commit)
+
+Chaque worker natif enveloppe la même mémoire virtuelle partagée dans
+son propre TrackedCpuMemory : clé SubmittedGpuState et filtres
+GpuWaitRegistry sur la référence brute → état GPU FRACTURÉ par thread
+(observé : un SubmitAcb frame-2 atterrit dans un état neuf, sequence
+repartie à 1, invisible du moniteur). Déroulage des chaînes
+ICpuMemoryWrapper partout où l'identité mémoire sert.
+
+### Résultat : régime permanent ~15,7 s/frame
+
+`log_yotei_arenaclose_1.txt` : 5 flip_capture (t=5,6 / 77,7 / 95,1 /
+110,8 / 126,5), alternance parfaite des deux display buffers et des
+deux rings de frame (supersedes 0x201162C3E4 ↔ 0x201452C3E4), 53
+fermetures d'arènes flushées. Le draw composite de chaque frame
+échantillonne bien la sortie compute de la frame (writer chain câblée).
+
+### Mur suivant (frame 6) : gate CPU, pas GPU
+
+Après le 5e flip : ZÉRO wait GPU non résolu (tous compteurs de fence à
+5), threads vivants (~3K imports/s de polling, trylock BUSY habituel),
+mais plus AUCUNE émission de travail GPU. Dernier acte : release_mem
+data=5 + write_data increment sur 0x2000000060. C'est un gate côté
+logique de jeu (attente d'un événement flip/pacing ? d'un compteur
+qu'on ne délivre pas ?), PAS une dépendance GPU — classe de problème
+différente de tout ce qui précède dans cette session.
