@@ -1647,3 +1647,51 @@ data=5 + write_data increment sur 0x2000000060. C'est un gate côté
 logique de jeu (attente d'un événement flip/pacing ? d'un compteur
 qu'on ne délivre pas ?), PAS une dépendance GPU — classe de problème
 différente de tout ce qui précède dans cette session.
+
+## 2026-07-18 (12e session, fin) — Sweep permanent + clipping : 5-8 flips/run
+
+### Mur frame-6 résolu : le jeu polle des labels côté CPU, sans waiter
+
+Après le 5e flip : zéro wait GPU, compteurs de fence à 5, mais le jeu
+pollait 0x20000000E0==5 dont le paquet data=5 existait, non soumis,
+dans l'arène COURANTE d'un builder — aucun trigger de stall possible
+(rien de soumis ne suspend). Fix (commit 2bcf90c) : le moniteur survit
+à ses waits quand la machinerie orpheline est active et balaye chaque
+tick tous les headers de builder connus (delta de curseur, 4 lectures
+qword par header, ~90 headers — négligeable).
+
+### Deux corrections d'exactitude découvertes par le sweep
+
+1. **Clipping de slices** : une arène de 64 Ko héberge À LA FOIS du
+   contenu game-submitted (le ring de compute[72] vit au milieu de
+   l'arène du builder 0x806AB69D0) et des paquets préambule jamais
+   soumis (en tête d'arène). Le skip alias tout-ou-rien affamait la
+   partie orpheline ; tout soumettre double-exécuterait la partie jeu
+   (write_data increment=True → compteurs corrompus). Les slices sont
+   clippées contre les plages jeu, seuls les segments non couverts
+   partent.
+2. **Plages chunk-chaînées enregistrées comme game-submitted** : le
+   submit graphics ne nomme que 29 dwords ; les chunks suivis par
+   chaînage sont du contenu jeu que le sweep re-soumettait (double
+   flip_capture d'une même frame observé). Enregistrés au suivi de
+   jump. PAS de trim au supersede — essayé live, le sweep double-
+   exécutait alors les fins de chunks que le jeu re-chaîne deux frames
+   plus tard (cadence effondrée 5→3 flips) ; coût accepté : un
+   compteur en retard dont le paquet suivant tombe dans une fin de
+   chunk jamais exécutée (mur actuel à ~5 flips).
+
+### État de fin de session
+
+- **5-8 flips présentés par run de 240 s** (le meilleur run, avant le
+  fix anti-doublons : 8 flips avec cadence accélérant 32→19→9 s/frame
+  à mesure que les caches shader chauffent), zéro fatal UCO sur ~8
+  runs consécutifs (tiering par défaut), zéro double-exécution.
+- Mur suivant : stall vers flip 5-6 sur compteur(s) en retard (built
+  vs executed diffèrent — ex. 0x20 built=5/exec=2, 0x1A0 built=6/
+  exec=3) dont les paquets manquants vivent dans les fins de chunks
+  game-recorded jamais parcourues. Piste : suivi précis des étendues
+  réellement parsées (au lieu de chunks entiers), ou exécution
+  différée de ces fins au moment du re-chaînage.
+- Cadence : ~12-20 s/frame en régime chaud. Leviers connus : drain
+  événementiel (remplacer le tick 1-16 ms), traductions shader à froid
+  (8 s observées sur un gros CS 4K).
