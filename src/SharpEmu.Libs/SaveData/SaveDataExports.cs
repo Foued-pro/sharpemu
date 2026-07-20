@@ -325,6 +325,9 @@ public static class SaveDataExports
         return SetReturn(ctx, 0);
     }
 
+    // sceSaveDataSetupSaveDataMemory2 / sceSaveDataGetSaveDataMemory2: upstream
+    // (par274/sharpemu) implements these with a real backing file, see below.
+
     private static bool TryReadSearchCond(CpuContext ctx, ulong address, out SearchCond cond)
     {
         cond = default;

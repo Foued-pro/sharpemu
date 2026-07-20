@@ -58,6 +58,18 @@ public static class NpEntitlementAccessExports
         return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
+    // sceNpEntitlementAccessGetAddcontEntitlementInfo (NID xddD23+8TfQ) was
+    // tried here as an "OK + empty info" HLE stub (mirroring the List sibling
+    // above) and reverted: A/B-tested live on 2026-07-19, it delays the
+    // GameState thread by 6x+ (never created after 11M+ imports / ~10 min,
+    // versus ~1.5M imports / ~200s without any implementation at all). The
+    // game apparently branches on this call's SUCCESS into a slower path
+    // (real hardware likely returns a specific "not entitled" SCE error here,
+    // not OK) — reporting the generic unresolved-import error the dispatcher
+    // already returns is closer to correct than a guessed success path. Do
+    // not re-add this export without the real expected error code confirmed
+    // (see PROGRESS.md, 16e session suite 14).
+
     private static void TraceNpEntitlementAccess(string message)
     {
         if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_NP"), "1", StringComparison.Ordinal))

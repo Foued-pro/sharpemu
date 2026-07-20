@@ -38,6 +38,10 @@ public static class SystemServiceExports
         }
 
         // No system notice screen to skip in the emulator; report "do not skip".
+        // The out parameter is a single bool byte: callers reserve exactly one
+        // byte for it (Yotei keeps it at rbp-0x29 with the stack canary at
+        // rbp-0x28), so writing anything wider corrupts the caller's canary
+        // and kills the thread via __stack_chk_fail.
         Span<byte> flagBytes = stackalloc byte[1];
         flagBytes[0] = 0;
         return ctx.Memory.TryWrite(flagAddress, flagBytes)

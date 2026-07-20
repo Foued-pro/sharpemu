@@ -3199,7 +3199,17 @@ public static partial class KernelMemoryCompatExports
         {
             if (!TryFindVirtualQueryRegionLocked(queryAddress, findNext: (flags & 0x1) != 0, out region))
             {
+                if (_logArenaProbe)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] vquery addr=0x{queryAddress:X} next={(flags & 0x1) != 0} -> NOT_FOUND");
+                }
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+            }
+            if (_logArenaProbe)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] vquery addr=0x{queryAddress:X} next={(flags & 0x1) != 0} -> region=[0x{region.Address:X}..0x{region.Address + region.Length:X}] flex={region.IsFlexible} direct={region.IsDirect}");
             }
 
             if (region.IsDirect && TryFindDirectAllocationLocked(region.DirectStart, out var allocation))
@@ -5756,6 +5766,9 @@ public static partial class KernelMemoryCompatExports
     // GetEnvironmentVariable P/Invoke per operation.
     private static readonly bool _traceDirectMemory = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_DIRECT_MEMORY"), "1", StringComparison.Ordinal);
+
+    private static readonly bool _logArenaProbe = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_ARENA_PROBE"), "1", StringComparison.Ordinal);
 
     private static bool ShouldTraceDirectMemory() => _traceDirectMemory;
 
