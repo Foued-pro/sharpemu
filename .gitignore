@@ -42,3 +42,12 @@ ehthumbs.db
 
 .vs/
 .idea/
+
+# Local debugging session artifacts (logs, crash dumps, RenderDoc
+# captures) — kept on disk for reference, never pushed.
+/log_*.txt
+/crashdumps/
+/renderdoc-captures/
+/*.pid
+/PROGRESS.md
+/scripts/resolve_got_plt_callers.py
