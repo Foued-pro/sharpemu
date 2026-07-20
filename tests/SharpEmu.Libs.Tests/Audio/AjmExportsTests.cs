@@ -81,6 +81,51 @@ public sealed class AjmExportsTests : IDisposable
     }
 
     [Fact]
+    public void ModuleRegister_AcceptsCodecTypesBeyondTheOldNarrowBound()
+    {
+        var contextId = Initialize();
+
+        // Codec type 0x18 (24) is what a shipped, retail title (Ghost of
+        // Yotei) registers during ordinary audio bring-up; a stale bound of
+        // 23 rejected it and stalled the whole boot. Registration is pure
+        // bookkeeping here, so any codec type that fits the instanceId
+        // packing (codecType << 14 | slot, see AjmInstanceCreate) must
+        // succeed.
+        Assert.Equal(0, RegisterCodec(contextId, 0x18));
+        Assert.Equal(0, CreateInstance(contextId, 0x18, 0x401, InstanceAddress));
+        Assert.Equal(0x60001u, ReadUInt32(InstanceAddress));
+    }
+
+    [Fact]
+    public void ModuleUnregister_AllowsReRegisterAndRejectsUnknownContext()
+    {
+        var contextId = Initialize();
+        Assert.Equal(0, RegisterCodec(contextId, 1));
+
+        Assert.Equal(0, UnregisterCodec(contextId, 1));
+        Assert.Equal(0, RegisterCodec(contextId, 1));
+        Assert.Equal(InvalidContext, UnregisterCodec(contextId + 1, 1));
+    }
+
+    [Fact]
+    public void ModuleUnregister_ToleratesCodecThatNeverRegistered()
+    {
+        var contextId = Initialize();
+
+        Assert.Equal(0, UnregisterCodec(contextId, 1));
+    }
+
+    [Fact]
+    public void Finalize_RejectsUnknownAndDoubleFinalizedContext()
+    {
+        var contextId = Initialize();
+        _ctx[CpuRegister.Rdi] = contextId;
+
+        Assert.Equal(0, AjmExports.AjmFinalize(_ctx));
+        Assert.Equal(InvalidContext, AjmExports.AjmFinalize(_ctx));
+    }
+
+    [Fact]
     public void InstanceDestroy_RejectsUnknownContextAndSlot()
     {
         var contextId = Initialize();
@@ -164,6 +209,13 @@ public sealed class AjmExportsTests : IDisposable
         _ctx[CpuRegister.Rsi] = codecType;
         _ctx[CpuRegister.Rdx] = 0;
         return AjmExports.AjmModuleRegister(_ctx);
+    }
+
+    private int UnregisterCodec(uint contextId, uint codecType)
+    {
+        _ctx[CpuRegister.Rdi] = contextId;
+        _ctx[CpuRegister.Rsi] = codecType;
+        return AjmExports.AjmModuleUnregister(_ctx);
     }
 
     private int CreateInstance(uint contextId, uint codecType, ulong flags, ulong outputAddress)

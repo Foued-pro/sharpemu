@@ -17,7 +17,18 @@ public static class AjmExports
     private const int OrbisAjmErrorCodecAlreadyRegistered = unchecked((int)0x80930009);
     private const int OrbisAjmErrorCodecNotRegistered = unchecked((int)0x8093000A);
     private const int OrbisAjmErrorWrongRevisionFlag = unchecked((int)0x8093000B);
-    private const uint MaxCodecType = 23;
+    // sceAjmModuleRegister/sceAjmInstanceCreate never decode audio themselves —
+    // registration is pure bookkeeping (a HashSet + a Dictionary), so the real
+    // limit isn't how many codecs any given emulator happens to implement. A
+    // small hardware-guessed bound here (23, borrowed from a third-party
+    // reverse-engineered array size, not a confirmed real firmware constant)
+    // was observed live rejecting a codec-type registration a shipped, retail
+    // title performs during ordinary audio bring-up — which stalled its whole
+    // boot. The bound instead follows our own instance-id packing
+    // (codecType << 14 | slot, see AjmInstanceCreate) with slot capped at
+    // MaxInstanceIndex (14 bits): codecType can go up to 2^18 without ever
+    // colliding with the slot bits.
+    private const uint MaxCodecType = 1u << 18;
     private const int MaxInstanceIndex = 0x2FFF;
     private static readonly ConcurrentDictionary<uint, AjmContextState> Contexts = new();
     private static int _nextContextId;
@@ -68,9 +79,12 @@ public static class AjmExports
         LibraryName = "libSceAjm")]
     public static int AjmFinalize(CpuContext ctx)
     {
-        Contexts.TryRemove(unchecked((uint)ctx[CpuRegister.Rdi]), out _);
-        ctx[CpuRegister.Rax] = 0;
-        return 0;
+        if (!Contexts.TryRemove(unchecked((uint)ctx[CpuRegister.Rdi]), out _))
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidContext);
+        }
+
+        return ctx.SetReturn(0);
     }
 
     [SysAbiExport(
@@ -209,8 +223,23 @@ public static class AjmExports
         LibraryName = "libSceAjm")]
     public static int AjmModuleUnregister(CpuContext ctx)
     {
-        ctx[CpuRegister.Rax] = 0;
-        return 0;
+        var contextId = unchecked((uint)ctx[CpuRegister.Rdi]);
+        var codecType = unchecked((uint)ctx[CpuRegister.Rsi]);
+        if (!Contexts.TryGetValue(contextId, out var state))
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidContext);
+        }
+
+        // A codec that was never (or no longer) registered is left alone rather
+        // than rejected: real titles unregister codec probes that already
+        // failed to register, and that must stay tolerated, not turned fatal.
+        lock (state.Gate)
+        {
+            state.RegisteredCodecs.Remove(codecType);
+        }
+
+        Trace($"module_unregister context={contextId} codec={codecType}");
+        return ctx.SetReturn(0);
     }
 
     [SysAbiExport(
