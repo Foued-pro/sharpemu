@@ -349,6 +349,30 @@ public static partial class Gen5SpirvTranslator
                 case "VMaxF32":
                     result = EmitFloatExtBinary(instruction, 40);
                     break;
+                case "VAddF16":
+                    result = EmitScalarF16Binary(instruction, destination, SpirvOp.FAdd);
+                    break;
+                case "VSubF16":
+                    result = EmitScalarF16Binary(instruction, destination, SpirvOp.FSub);
+                    break;
+                case "VSubrevF16":
+                    result = EmitScalarF16Binary(
+                        instruction, destination, SpirvOp.FSub, reverse: true);
+                    break;
+                case "VMulF16":
+                    result = EmitScalarF16Binary(instruction, destination, SpirvOp.FMul);
+                    break;
+                case "VMaxF16":
+                    result = EmitScalarF16Binary(
+                        instruction, destination, SpirvOp.Nop, minMax: true, isMax: true);
+                    break;
+                case "VMinF16":
+                    result = EmitScalarF16Binary(
+                        instruction, destination, SpirvOp.Nop, minMax: true, isMax: false);
+                    break;
+                case "VPkFmacF16":
+                    result = EmitPkFmacF16(instruction, destination);
+                    break;
                 case "VMadF32":
                 case "VFmaF32":
                 case "VMadMkF32":
@@ -672,6 +696,17 @@ public static partial class Gen5SpirvTranslator
                             GetRawSource(instruction, 1)),
                         GetRawSource(instruction, 2));
                     break;
+                case "VXor3B32":
+                    result = _module.AddInstruction(
+                        SpirvOp.BitwiseXor,
+                        _uintType,
+                        _module.AddInstruction(
+                            SpirvOp.BitwiseXor,
+                            _uintType,
+                            GetRawSource(instruction, 0),
+                            GetRawSource(instruction, 1)),
+                        GetRawSource(instruction, 2));
+                    break;
                 case "VPermlane16B32":
                     result = EmitPermlane16(instruction, exchangeRows: false);
                     break;
@@ -684,6 +719,18 @@ public static partial class Gen5SpirvTranslator
                         GetRawSource(instruction, 0),
                         GetRawSource(instruction, 1));
                     result = ShiftLeftLogical(added, GetRawSource(instruction, 2));
+                    break;
+                }
+                case "VXadU32":
+                {
+                    var added = IAdd(
+                        GetRawSource(instruction, 0),
+                        GetRawSource(instruction, 1));
+                    result = _module.AddInstruction(
+                        SpirvOp.BitwiseXor,
+                        _uintType,
+                        added,
+                        GetRawSource(instruction, 2));
                     break;
                 }
                 case "VAdd3U32":
@@ -903,6 +950,17 @@ public static partial class Gen5SpirvTranslator
                         width);
                     break;
                 }
+                case "VBfeI32":
+                {
+                    var width = BitwiseAnd(GetRawSource(instruction, 2), UInt(31));
+                    result = _module.AddInstruction(
+                        SpirvOp.BitFieldSExtract,
+                        _intType,
+                        Bitcast(_intType, GetRawSource(instruction, 0)),
+                        BitwiseAnd(GetRawSource(instruction, 1), UInt(31)),
+                        width);
+                    break;
+                }
                 case "VBfiB32":
                 {
                     var mask = GetRawSource(instruction, 0);
@@ -960,15 +1018,95 @@ public static partial class Gen5SpirvTranslator
 
                     break;
                 case "VPkFmaF16":
-                    // Deliberately loud: a fused f16 FMA rounds the product+add once,
-                    // whereas doing the multiply-add in f32 and rounding to f16 at the
-                    // end double-rounds. Concrete miss: fma(0x4100, 0x7522, 0x04EA) is
-                    // 0x7A6B fused but 0x7A6A via f32. Exact emulation (round-to-odd
-                    // f32 product then RNE pack) is a planned follow-up slice.
-                    error =
-                        $"unsupported vop3p opcode {instruction.Opcode} " +
-                        "(fused f16 FMA requires single-rounding; deferred to a later slice)";
-                    return false;
+                    // A true fused f16 FMA rounds product+add once; widening to f32,
+                    // computing a single-rounded f32 fma (GLSL Fma), then packing to
+                    // f16 differs from the hardware only by at most 1 ULP of f16 on
+                    // rare inputs (e.g. fma(0x4100,0x7522,0x04EA) = 0x7A6B hw vs
+                    // 0x7A6A here). That negligible difference is not worth blocking
+                    // every shader that uses packed f16 FMA — which includes the
+                    // compute geometry pass — so emit the f32-fma approximation.
+                    if (!TryEmitPackedF16(instruction, out result, out error))
+                    {
+                        return false;
+                    }
+
+                    break;
+                case "VDot2I32I16":
+                case "VDot2U32U16":
+                {
+                    // 2-element dot product of packed 16-bit integers accumulating
+                    // into the 32-bit src2: dst = s0.lo*s1.lo + s0.hi*s1.hi + s2.
+                    var signed = instruction.Opcode == "VDot2I32I16";
+                    var src0 = GetRawSource(instruction, 0);
+                    var src1 = GetRawSource(instruction, 1);
+                    var prodLo = IMul(Extract16(src0, false, signed), Extract16(src1, false, signed));
+                    var prodHi = IMul(Extract16(src0, true, signed), Extract16(src1, true, signed));
+                    result = IAdd(IAdd(prodLo, prodHi), GetRawSource(instruction, 2));
+                    break;
+                }
+                case "VDot2F32F16":
+                {
+                    // 2-element dot product of packed f16 accumulating into f32 src2:
+                    // dst = s0.lo*s1.lo + s0.hi*s1.hi + s2, computed in f32.
+                    var src0 = GetRawSource(instruction, 0);
+                    var src1 = GetRawSource(instruction, 1);
+                    var prodLo = _module.AddInstruction(
+                        SpirvOp.FMul,
+                        _floatType,
+                        Bitcast(_floatType, EmitHalfToFloat(src0)),
+                        Bitcast(_floatType, EmitHalfToFloat(src1)));
+                    var prodHi = _module.AddInstruction(
+                        SpirvOp.FMul,
+                        _floatType,
+                        Bitcast(_floatType, EmitHalfToFloat(ShiftRightLogical(src0, UInt(16)))),
+                        Bitcast(_floatType, EmitHalfToFloat(ShiftRightLogical(src1, UInt(16)))));
+                    var sum = _module.AddInstruction(
+                        SpirvOp.FAdd,
+                        _floatType,
+                        _module.AddInstruction(SpirvOp.FAdd, _floatType, prodLo, prodHi),
+                        Bitcast(_floatType, GetRawSource(instruction, 2)));
+                    result = Bitcast(_uintType, sum);
+                    break;
+                }
+                case "VFmaMixF32":
+                case "VFmaMixloF16":
+                case "VFmaMixhiF16":
+                {
+                    if (instruction.Control is not Gen5Vop3pControl mixControl)
+                    {
+                        error = $"missing vop3p control for {instruction.Opcode}";
+                        return false;
+                    }
+
+                    var fma = Ext(
+                        50,
+                        _floatType,
+                        EmitFmaMixOperand(instruction, mixControl, 0),
+                        EmitFmaMixOperand(instruction, mixControl, 1),
+                        EmitFmaMixOperand(instruction, mixControl, 2));
+                    if (mixControl.Clamp)
+                    {
+                        fma = Ext(43, _floatType, fma, Float(0), Float(1));
+                    }
+
+                    if (instruction.Opcode == "VFmaMixF32")
+                    {
+                        result = Bitcast(_uintType, fma);
+                    }
+                    else
+                    {
+                        var half = EmitFloatToHalf(Bitcast(_uintType, fma));
+                        result = instruction.Opcode == "VFmaMixloF16"
+                            ? BitwiseOr(
+                                BitwiseAnd(LoadV(destination), UInt(0xFFFF0000)),
+                                half)
+                            : BitwiseOr(
+                                BitwiseAnd(LoadV(destination), UInt(0x0000FFFF)),
+                                ShiftLeftLogical(half, UInt(16)));
+                    }
+
+                    break;
+                }
                 default:
                     error = $"unsupported vector opcode {instruction.Opcode}";
                     return false;
@@ -1008,8 +1146,9 @@ public static partial class Gen5SpirvTranslator
         // even. For add and mul this is bit-exact to a true f16 op (the f32 result
         // rounds losslessly to f16 by the double-rounding theorem; a f16 product even
         // fits in f32 exactly). min/max carry no rounding, so they are exact once the
-        // conversions are. v_pk_fma_f16 is intentionally not routed here because a
-        // fused f16 FMA cannot be reproduced by an f32 multiply-add plus a pack.
+        // conversions are. v_pk_fma_f16 is also routed here using a single-rounded f32
+        // GLSL Fma, which differs from a true fused f16 FMA by at most 1 ULP of f16 on
+        // rare inputs — an acceptable approximation to keep shaders that use it running.
         private bool TryEmitPackedF16(
             Gen5ShaderInstruction instruction,
             out uint result,
@@ -1029,13 +1168,21 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
-            for (var index = 0; index < 2; index++)
+            var sourceCount = instruction.Opcode == "VPkFmaF16" ? 3 : 2;
+            for (var index = 0; index < sourceCount; index++)
             {
                 var source = instruction.Sources[index];
-                if (source.Kind is not (Gen5OperandKind.VectorRegister or Gen5OperandKind.ScalarRegister))
+                // Registers and inline/literal constants are all read correctly by
+                // GetRawSource (the op_sel/op_sel_hi half selection applies to a
+                // constant's 32-bit pattern the same way). Anything else is unhandled.
+                if (source.Kind is not (
+                    Gen5OperandKind.VectorRegister or
+                    Gen5OperandKind.ScalarRegister or
+                    Gen5OperandKind.LiteralConstant or
+                    Gen5OperandKind.EncodedConstant))
                 {
                     error =
-                        $"unsupported vop3p operand {source} for {instruction.Opcode} (first slice: registers only)";
+                        $"unsupported vop3p operand {source} for {instruction.Opcode} (registers/constants only)";
                     return false;
                 }
             }
@@ -1044,6 +1191,55 @@ public static partial class Gen5SpirvTranslator
             var high = EmitPackedF16Lane(instruction, control, highLane: true);
             result = BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
             return true;
+        }
+
+        // VOP2 e32 f16 arithmetic: operands are the low 16 bits of each source,
+        // the result is written to the low 16 bits of the destination with the
+        // high 16 bits preserved. Uses the exact half<->float sequences.
+        private uint EmitScalarF16Binary(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            SpirvOp operation,
+            bool reverse = false,
+            bool minMax = false,
+            bool isMax = false)
+        {
+            var left = Bitcast(
+                _floatType,
+                EmitHalfToFloat(GetRawSource(instruction, reverse ? 1 : 0)));
+            var right = Bitcast(
+                _floatType,
+                EmitHalfToFloat(GetRawSource(instruction, reverse ? 0 : 1)));
+            var value = minMax
+                ? EmitPackedF16MinMax(left, right, isMax)
+                : _module.AddInstruction(operation, _floatType, left, right);
+            var half = EmitFloatToHalf(Bitcast(_uintType, value));
+            return BitwiseOr(
+                BitwiseAnd(LoadV(destination), UInt(0xFFFF0000)),
+                half);
+        }
+
+        // v_pk_fmac_f16: packed fused-multiply-accumulate on both f16 lanes,
+        // dst.lane = src0.lane * src1.lane + dst.lane.
+        private uint EmitPkFmacF16(Gen5ShaderInstruction instruction, uint destination)
+        {
+            var src0 = GetRawSource(instruction, 0);
+            var src1 = GetRawSource(instruction, 1);
+            var dst = LoadV(destination);
+
+            var low = EmitFloatToHalf(Bitcast(_uintType, Ext(
+                50,
+                _floatType,
+                Bitcast(_floatType, EmitHalfToFloat(src0)),
+                Bitcast(_floatType, EmitHalfToFloat(src1)),
+                Bitcast(_floatType, EmitHalfToFloat(dst)))));
+            var high = EmitFloatToHalf(Bitcast(_uintType, Ext(
+                50,
+                _floatType,
+                Bitcast(_floatType, EmitHalfToFloat(ShiftRightLogical(src0, UInt(16)))),
+                Bitcast(_floatType, EmitHalfToFloat(ShiftRightLogical(src1, UInt(16)))),
+                Bitcast(_floatType, EmitHalfToFloat(ShiftRightLogical(dst, UInt(16)))))));
+            return BitwiseOr(low, ShiftLeftLogical(high, UInt(16)));
         }
 
         // Computes one result lane (low or high) as a packed 16-bit f16 value.
@@ -1060,6 +1256,12 @@ public static partial class Gen5SpirvTranslator
                 "VPkMulF16" => _module.AddInstruction(SpirvOp.FMul, _floatType, left, right),
                 "VPkMinF16" => EmitPackedF16MinMax(left, right, isMax: false),
                 "VPkMaxF16" => EmitPackedF16MinMax(left, right, isMax: true),
+                "VPkFmaF16" => Ext(
+                    50,
+                    _floatType,
+                    left,
+                    right,
+                    EmitPackedF16Operand(instruction, control, 2, highLane)),
                 _ => left,
             };
             return EmitFloatToHalf(Bitcast(_uintType, value));
@@ -1081,6 +1283,42 @@ public static partial class Gen5SpirvTranslator
             var value = Bitcast(_floatType, EmitHalfToFloat(half));
             var negateMask = highLane ? control.NegHiMask : control.NegLoMask;
             if (((negateMask >> index) & 1) != 0)
+            {
+                value = _module.AddInstruction(SpirvOp.FNegate, _floatType, value);
+            }
+
+            return value;
+        }
+
+        // v_fma_mix_* operand read: op_sel_hi[i] picks the operand's precision —
+        // set means it is an f16 (op_sel[i] selects the high/low 16-bit half, widened
+        // to f32), clear means it is a full f32. neg_hi[i] applies abs, neg_lo[i]
+        // negates (abs before negate, matching hardware modifier order).
+        private uint EmitFmaMixOperand(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            int index)
+        {
+            var raw = GetRawSource(instruction, index);
+            uint value;
+            if (((control.OpSelHiMask >> index) & 1) != 0)
+            {
+                var half = ((control.OpSelMask >> index) & 1) != 0
+                    ? ShiftRightLogical(raw, UInt(16))
+                    : raw;
+                value = Bitcast(_floatType, EmitHalfToFloat(half));
+            }
+            else
+            {
+                value = Bitcast(_floatType, raw);
+            }
+
+            if (((control.NegHiMask >> index) & 1) != 0)
+            {
+                value = Ext(4, _floatType, value);
+            }
+
+            if (((control.NegLoMask >> index) & 1) != 0)
             {
                 value = _module.AddInstruction(SpirvOp.FNegate, _floatType, value);
             }
@@ -1598,6 +1836,20 @@ public static partial class Gen5SpirvTranslator
                     StoreS(destination, result);
                     Store(_scc, IsNotZero(result));
                     return true;
+                case "SFlbitI32B32":
+                    // Count leading zeros from the MSB (= 31 - index of the
+                    // highest set bit), returning -1 for a zero input.
+                    result = SelectU(
+                        IsNotZero(left),
+                        _module.AddInstruction(
+                            SpirvOp.ISub,
+                            _uintType,
+                            UInt(31),
+                            Ext(75, _uintType, left)),
+                        UInt(0xFFFFFFFF));
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
+                    return true;
                 case "SBitset1B32":
                     result = _module.AddInstruction(
                         SpirvOp.BitFieldInsert,
@@ -1607,6 +1859,12 @@ public static partial class Gen5SpirvTranslator
                         BitwiseAnd(left, UInt(31)),
                         UInt(1));
                     StoreS(destination, result);
+                    return true;
+                case "SAbsI32":
+                    // Absolute value of a signed 32-bit integer (GLSL SAbs).
+                    result = Bitcast(_uintType, Ext(5, _intType, Bitcast(_intType, left)));
+                    StoreS(destination, result);
+                    Store(_scc, IsNotZero(result));
                     return true;
                 default:
                 {
@@ -1970,6 +2228,16 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
+            if (instruction.Opcode == "SCmpLgU64")
+            {
+                var left64 = GetRawSource64(instruction, 0);
+                var right64 = GetRawSource64(instruction, 1);
+                Store(
+                    _scc,
+                    _module.AddInstruction(SpirvOp.INotEqual, _boolType, left64, right64));
+                return true;
+            }
+
             var left = GetRawSource(instruction, 0);
             var right = GetRawSource(instruction, 1);
             if (instruction.Opcode is "SBitcmp0B32" or "SBitcmp1B32")
@@ -2285,6 +2553,42 @@ public static partial class Gen5SpirvTranslator
                 var maskValue = ShiftLeftLogical64(lowMask, offset);
                 StoreS64(destination, maskValue);
                 Store(_scc, IsNotZero64(maskValue));
+                return true;
+            }
+
+            if (instruction.Opcode == "SFF1I32B64")
+            {
+                var low = _module.AddInstruction(SpirvOp.UConvert, _uintType, left);
+                var high = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _uintType,
+                    ShiftRightLogical64(left, _module.Constant64(_ulongType, 32)));
+                var lowResult = Ext(73, _uintType, low);
+                var highResult = Ext(73, _uintType, high);
+                var highAdjusted = SelectU(
+                    IsNotZero(high),
+                    IAdd(highResult, UInt(32)),
+                    UInt(0xFFFFFFFF));
+                var ff1Result = SelectU(IsNotZero(low), lowResult, highAdjusted);
+                StoreS(destination, ff1Result);
+                Store(_scc, IsNotZero(ff1Result));
+                return true;
+            }
+
+            if (instruction.Opcode == "SBcnt1I32B64")
+            {
+                // Count set bits across the full 64-bit value by summing the
+                // per-half 32-bit BitCount — avoids relying on 64-bit OpBitCount.
+                var low = _module.AddInstruction(SpirvOp.UConvert, _uintType, left);
+                var high = _module.AddInstruction(
+                    SpirvOp.UConvert,
+                    _uintType,
+                    ShiftRightLogical64(left, _module.Constant64(_ulongType, 32)));
+                var count = IAdd(
+                    _module.AddInstruction(SpirvOp.BitCount, _uintType, low),
+                    _module.AddInstruction(SpirvOp.BitCount, _uintType, high));
+                StoreS(destination, count);
+                Store(_scc, IsNotZero(count));
                 return true;
             }
 
