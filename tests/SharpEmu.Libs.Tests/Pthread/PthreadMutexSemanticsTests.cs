@@ -9,8 +9,19 @@ namespace SharpEmu.Libs.Tests.Pthread;
 
 public sealed class PthreadMutexSemanticsTests
 {
+    // FreeBSD/Orbis NORMAL and ADAPTIVE mutexes are non-recursive: a self
+    // relock is a real error (EDEADLK), not implicit recursion. Ghost of
+    // Yotei's FaWorkerIo1 worker relies on that EDEADLK to be genuine — its
+    // own error path tolerates the failed relock and moves on. A permissive
+    // "just increment the count" self-relock (tried upstream as a stall
+    // workaround for another title, see #383) instead leaves the mutex held
+    // across FaWorkerIo1's subsequent cond_wait, permanently starving every
+    // other thread that needs it: reproduced live at import#13056 (3/3),
+    // and independently on pure upstream/main with no SharpEmu-side changes
+    // at all (import#18432) — so this is the correct default, not a
+    // Yotei-only carve-out.
     [Fact]
-    public void AdaptiveMutex_SelfLockUsesCompatibilityRecursion()
+    public void AdaptiveMutex_SelfLockReturnsDeadlock()
     {
         const ulong memoryBase = 0x1_0000_0000;
         const ulong mutexAddress = memoryBase + 0x100;
@@ -20,8 +31,7 @@ public sealed class PthreadMutexSemanticsTests
         context[CpuRegister.Rdi] = mutexAddress;
 
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
-        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
-        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK, KernelPthreadCompatExports.PthreadMutexLock(context));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));
     }
 
