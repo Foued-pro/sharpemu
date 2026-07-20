@@ -38,6 +38,7 @@
   "Options.Env.LogDirectMemory.Desc": "Log direct memory allocations and failures to the console.\nUse when a game aborts or exits during boot.",
   "Options.Env.LogIo.Desc": "Log file open, read, and path-resolve activity to the console.\nUse when a game cannot find its data files during boot.",
   "Options.Env.LogNp.Desc": "Log NP (PlayStation Network) library calls to the console.",
+  "Options.Env.OrphanPreambles.Desc": "Resubmit async-compute rings the title appends to without submitting again.\nNeeded by titles whose rendering stops after a single draw. Validated on one title only.",
   "Options.Section.Emulation": "EMULATION",
   "Options.Section.Logging": "LOGGING",
   "Options.Section.Launcher": "LAUNCHER",

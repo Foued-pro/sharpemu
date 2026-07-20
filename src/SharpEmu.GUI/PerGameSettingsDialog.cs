@@ -23,6 +23,7 @@ public sealed class PerGameSettingsDialog : Window
         "SHARPEMU_LOG_DIRECT_MEMORY",
         "SHARPEMU_LOG_IO",
         "SHARPEMU_LOG_NP",
+        "SHARPEMU_FORCE_SUBMIT_ORPHAN_PREAMBLES",
     };
 
     private readonly string _titleId;

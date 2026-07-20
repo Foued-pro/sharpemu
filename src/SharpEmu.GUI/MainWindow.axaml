@@ -458,6 +458,12 @@ SPDX-License-Identifier: GPL-2.0-or-later
                         <ToggleSwitch x:Name="EnvLogNpToggle" OnContent="On" OffContent="Off"
                                       VerticalAlignment="Center" />
                       </local:SettingRow>
+
+                      <local:SettingRow x:Name="EnvOrphanPreamblesRow" LabelFontFamily="Consolas,monospace" Label="SHARPEMU_FORCE_SUBMIT_ORPHAN_PREAMBLES"
+                                        Description="Resubmit async-compute rings the title appends to without submitting again.&#10;Needed by titles whose rendering stops after a single draw. Validated on one title only.">
+                        <ToggleSwitch x:Name="EnvOrphanPreamblesToggle" OnContent="On" OffContent="Off"
+                                      VerticalAlignment="Center" />
+                      </local:SettingRow>
                     </StackPanel>
                   </Border>
 

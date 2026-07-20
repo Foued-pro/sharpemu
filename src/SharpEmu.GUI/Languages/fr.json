@@ -35,6 +35,7 @@
   "Options.Env.DumpSpirv.Desc": "Exporter les shaders AGC et leurs traductions SPIR-V dans le dossier shader-dumps.\nÀ utiliser pour signaler des bugs de shader ou de rendu.",
   "Options.Env.LogDirectMemory.Desc": "Journaliser les allocations de mémoire directe et les échecs dans la console.\nÀ utiliser quand un jeu plante ou se ferme pendant le démarrage.",
   "Options.Env.LogNp.Desc": "Journaliser les appels de la bibliothèque NP (PlayStation Network) dans la console.",
+  "Options.Env.OrphanPreambles.Desc": "Resoumettre les anneaux de calcul asynchrone que le jeu complète sans les resoumettre.\nNécessaire aux jeux dont le rendu s'arrête après un seul draw. Validé sur un seul jeu.",
   "Options.Section.Emulation": "ÉMULATION",
   "Options.Section.Logging": "JOURNALISATION",
   "Options.Section.Launcher": "LANCEUR",
