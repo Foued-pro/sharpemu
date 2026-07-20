@@ -13,6 +13,8 @@ using SharpEmu.Core.Cpu.Debugging;
 using SharpEmu.Core.Loader;
 using SharpEmu.Core.Memory;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Agc;
+using SharpEmu.Libs.VideoOut;
 
 namespace SharpEmu.Core.Cpu.Native;
 
@@ -333,6 +335,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private bool _logBootstrap;
 
 	private bool _logAllImports;
+
+	private static ulong[]? _watchGuestQwordAddrs;
+
+	private static ulong[]? _watchGuestQwordValues;
 
 	private bool _logImportFrames;
 
@@ -738,6 +744,23 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private Thread? _stallWatchdogThread;
 
+	// Flip-stall diagnostics (distinct from the import-progress stall above):
+	// last time an enriched snapshot was emitted, and each guest thread's
+	// import count as of that snapshot, to report per-thread progress deltas
+	// instead of a raw one-shot dump.
+	private long _lastFlipStallLogTimestamp;
+
+	private readonly Dictionary<ulong, long> _flipStallPrevImportCounts = new();
+
+	private ulong _flipStallPrevMainRip;
+
+	// OS thread id of the process's entry thread, recorded right before it
+	// enters RunGuestEntryStub. Everything else in the flip-stall snapshot
+	// reads managed-side state (_cpuContext); this is the only handle that
+	// lets the watchdog ask the OS directly whether that thread still exists
+	// and where it is actually executing.
+	private int _mainEntryHostThreadId;
+
 	private volatile bool _readyDispatchStop;
 
 	private Thread? _readyDispatchThread;
@@ -850,9 +873,29 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private const uint ThreadSuspendResume = 0x0002u;
 
+	private const uint ThreadQueryLimitedInformation = 0x0800u;
+
+	private const uint StillActiveExitCode = 259u;
+
 	private const int Win64ContextSize = 0x4D0;
 
 	private const int Win64ContextFlagsOffset = 0x30;
+
+	// CONTEXT_AMD64 | CONTEXT_DEBUG_REGISTERS — the minimum flag set for
+	// Get/SetThreadContext to touch Dr0-Dr7 without disturbing the rest of
+	// the (possibly currently-running) thread's register state.
+	private const uint ContextAmd64DebugRegistersInteger = 0x00100010u;
+
+	private const uint ThreadSetContext = 0x0010u;
+
+	// Offsets into the Win64 CONTEXT struct (winnt.h layout, x64): the six
+	// debug registers (Dr0,Dr1,Dr2,Dr3,Dr6,Dr7 — no Dr4/Dr5 field exists)
+	// sit right after ContextFlags(4)/MxCsr(4)/6 segment WORDs(12)/EFlags(4)
+	// = 0x30 + 0x18 = 0x48, six consecutive qwords ending at Dr7=0x70.
+	private const int Win64ContextDr0Offset = 0x48;
+	private const int Win64ContextDr6Offset = 0x68;
+	private const int Win64ContextDr7Offset = 0x70;
+	private const int Win64ContextEFlagsOffset = 0x44;
 
 	private readonly record struct HostThreadContextSnapshot(
 		bool IsValid,
@@ -1157,6 +1200,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_contextualUnresolvedReturnSites.Clear();
 		_stallWatchdogTriggered = 0;
 		_stallWatchdogStop = false;
+		_lastFlipStallLogTimestamp = 0;
+		_flipStallPrevImportCounts.Clear();
+		_flipStallPrevMainRip = 0;
 		_readyDispatchStop = false;
 		_patchedEa020eLookupCall = false;
 		MarkExecutionProgress();
@@ -3196,7 +3242,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				_readyGuestThreads.Enqueue(thread);
 				Interlocked.Increment(ref _readyGuestThreadCount);
 				wakeCount++;
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] cooperative_block_resumed thread=0x{thread.ThreadHandle:X16} name='{thread.Name}' wake_key={wakeKey}");
 			}
+		}
+
+		if (wakeCount == 0)
+		{
+			Console.Error.WriteLine($"[LOADER][WARN] cooperative_block_wake_no_match wake_key={wakeKey}");
 		}
 
 		if (wakeCount != 0)
@@ -3247,6 +3300,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		if (guestThreadHandle == 0 || continuation.Rip < 65536 || continuation.Rsp == 0)
 		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] cooperative_block_register_dropped reason=invalid_args " +
+				$"guest_handle=0x{guestThreadHandle:X16} rip=0x{continuation.Rip:X16} rsp=0x{continuation.Rsp:X16} wake_key={wakeKey}");
 			return;
 		}
 
@@ -3254,6 +3310,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			if (!_guestThreads.TryGetValue(guestThreadHandle, out var thread))
 			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] cooperative_block_register_dropped reason=unknown_thread " +
+					$"guest_handle=0x{guestThreadHandle:X16} wake_key={wakeKey}");
 				return;
 			}
 
@@ -4775,11 +4834,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						thread.ExitValue = thread.Context[CpuRegister.Rax];
 						thread.State = GuestThreadRunState.Exited;
 						if (_logGuestThreads)
-						Console.Error.WriteLine(
-							$"[LOADER][INFO] Guest thread exited: name='{thread.Name}' " +
-							$"exitValue=0x{thread.ExitValue:X16} imports={Interlocked.Read(ref thread.ImportCount)} " +
-							$"lastNid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
-							$"entry=0x{thread.EntryPoint:X16} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16}");
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][INFO] Guest thread exited: name='{thread.Name}' " +
+								$"exitValue=0x{thread.ExitValue:X16} imports={Interlocked.Read(ref thread.ImportCount)} " +
+								$"lastNid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
+								$"entry=0x{thread.EntryPoint:X16} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16}");
+						}
 						break;
 					case GuestNativeCallExitReason.Blocked:
 						thread.State = GuestThreadRunState.Blocked;
@@ -4804,7 +4865,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			if (_logGuestThreads)
 			{
 				Console.Error.WriteLine(
-					$"[LOADER][INFO] Guest thread '{thread.Name}' state={thread.State} reason={blockReason ?? "none"}");
+					$"[LOADER][INFO] Guest thread '{thread.Name}' state={thread.State} reason={blockReason ?? "none"} " +
+					$"exit=0x{thread.ExitValue:X16} lastNid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
+					$"lastRet=0x{Volatile.Read(ref thread.LastReturnRip):X16}");
 			}
 		}
 		finally
@@ -5549,6 +5612,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				Console.Error.WriteLine("[LOADER][INFO] Sentinel probe returned.");
 			}
 			Console.Error.WriteLine("[LOADER][INFO] Calling guest entry...");
+			Volatile.Write(ref _mainEntryHostThreadId, unchecked((int)GetCurrentThreadId()));
+			_bootTimestamp = Stopwatch.GetTimestamp();
 			StartStallWatchdog();
 			StartReadyThreadDispatcher();
 			int num6 = -1;
@@ -5642,6 +5707,39 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return 20;
 	}
 
+	// Flip-stall diagnostics: imports can keep advancing (real thread work)
+	// while no new frame ever presents (a GPU/AGC sync gap, not a kernel-wait
+	// lost wakeup) — the import-progress watchdog above is blind to that
+	// symptom by design. Once no flip has landed for this many seconds, start
+	// logging an enriched snapshot (GPU wait registry + per-thread progress
+	// deltas) on the interval below, so the log captures a timeline through
+	// the stall instead of a single dump 4+ minutes in. Zero disables it.
+	private static double GetFlipStallLogThresholdSeconds()
+	{
+		if (double.TryParse(
+				Environment.GetEnvironmentVariable("SHARPEMU_FLIP_STALL_LOG_SECONDS"),
+				System.Globalization.NumberStyles.Float,
+				System.Globalization.CultureInfo.InvariantCulture,
+				out var result))
+		{
+			return Math.Max(0, result);
+		}
+		return 30;
+	}
+
+	private static double GetFlipStallLogIntervalSeconds()
+	{
+		if (double.TryParse(
+				Environment.GetEnvironmentVariable("SHARPEMU_FLIP_STALL_LOG_INTERVAL_SECONDS"),
+				System.Globalization.NumberStyles.Float,
+				System.Globalization.CultureInfo.InvariantCulture,
+				out var result))
+		{
+			return Math.Max(1, result);
+		}
+		return 7;
+	}
+
 
 	private void StartStallWatchdog()
 	{
@@ -5695,6 +5793,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					LogStallWatchdogSnapshot();
 					Console.Error.Flush();
 				}
+				MaybeLogFlipStallSnapshot();
+				MaybeLogDcbSubmitWentQuiet();
 				long num2 = Stopwatch.GetTimestamp() - Volatile.Read(ref _lastProgressTimestamp);
 				if (num2 < num)
 				{
@@ -6061,6 +6161,401 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	// Distinct from LogStallWatchdogSnapshot above: that one fires once, right
+	// before the import-progress watchdog kills the process. This one starts
+	// logging as soon as flips stop landing (imports may still be advancing
+	// normally) and repeats on an interval, so a run that "just runs slow"
+	// produces a visible timeline instead of silence until a fixed exit
+	// timeout. See FlipProgressTracker's doc comment for why this needs to be
+	// a separate signal from import progress.
+	private void MaybeLogFlipStallSnapshot()
+	{
+		var secondsSinceFlip = FlipProgressTracker.SecondsSinceLastFlip();
+		if (secondsSinceFlip is not { } stalledSeconds ||
+			stalledSeconds < GetFlipStallLogThresholdSeconds())
+		{
+			return;
+		}
+
+		var nowTicks = Stopwatch.GetTimestamp();
+		var intervalTicks = (long)(GetFlipStallLogIntervalSeconds() * Stopwatch.Frequency);
+		if (nowTicks - Volatile.Read(ref _lastFlipStallLogTimestamp) < intervalTicks)
+		{
+			return;
+		}
+
+		Volatile.Write(ref _lastFlipStallLogTimestamp, nowTicks);
+		LogFlipStallSnapshot(stalledSeconds);
+	}
+
+	// _guestThreadGate (LockGate) backs almost every guest-thread-state
+	// operation AND is taken on every single import dispatch via
+	// DeliverPendingGuestExceptionAtSafePoint — so a caller stuck holding it
+	// (an infinite loop, a deadlock, a slow scan under the lock) would freeze
+	// every other thread's next import call at the exact same generic
+	// checkpoint, regardless of which NID they were dispatching. The
+	// diagnostic fields for this already existed (_gateOwnerSite etc, "read
+	// lock-free by the stall watchdog's periodic snapshot" per their own
+	// comment) but were never actually wired to any log line until now.
+	private void LogGuestThreadGateOwner()
+	{
+		var site = _gateOwnerSite;
+		if (site is null)
+		{
+			return;
+		}
+
+		var ownerManagedThreadId = Volatile.Read(ref _gateOwnerManagedThreadId);
+		var heldSeconds = (Stopwatch.GetTimestamp() - Volatile.Read(ref _gateAcquireTimestamp)) / (double)Stopwatch.Frequency;
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Stall guest_thread_gate: held_by_site={site} owner_managed_tid={ownerManagedThreadId} " +
+			$"held_for={heldSeconds:F1}s");
+	}
+
+	// Set once, right before guest entry starts, so every stall-watchdog log
+	// can report a "seconds since boot" figure comparable across events with
+	// very different rates.
+	private static long _bootTimestamp;
+
+	private static double ElapsedSecondsSinceBoot() =>
+		_bootTimestamp == 0
+			? 0
+			: (Stopwatch.GetTimestamp() - _bootTimestamp) / (double)Stopwatch.Frequency;
+
+	// Fires exactly once, the instant sceAgcDriverSubmitDcb activity has been
+	// silent for a while after having been active — catches the freeze
+	// moment itself (with full thread state, right when it happens) instead
+	// of waiting for the flip-stall watchdog's own periodic snapshot, which
+	// is too coarse-grained to see what every thread was doing right as
+	// everything went idle together.
+	private const double DcbSubmitQuietThresholdSeconds = 3.0;
+
+	private static readonly bool _watchDcbSubmitEnabled =
+		string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_WATCH_DCB_SUBMIT"),
+			"1",
+			StringComparison.Ordinal);
+
+	// -1 = "never dumped yet"; otherwise the submit count observed at the
+	// last dump. Comparing against the LIVE count (not a one-shot flag)
+	// lets the watcher re-arm itself after any quiet spell that turns out
+	// to be transient (e.g. a normal pause between boot-time submissions
+	// and the real per-frame loop starting) and still catch the true final
+	// freeze later.
+	private static long _dcbSubmitCountAtLastDump = -1;
+
+	private void MaybeLogDcbSubmitWentQuiet()
+	{
+		if (!_watchDcbSubmitEnabled)
+		{
+			return;
+		}
+
+		var (count, secondsSinceLastSubmit) = AgcExports.DcbSubmitHeartbeat();
+		if (secondsSinceLastSubmit < 0 || secondsSinceLastSubmit < DcbSubmitQuietThresholdSeconds)
+		{
+			return;
+		}
+
+		if (Interlocked.Read(ref _dcbSubmitCountAtLastDump) == count)
+		{
+			return;
+		}
+
+		if (Interlocked.Exchange(ref _dcbSubmitCountAtLastDump, count) == count)
+		{
+			return;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] --- sceAgcDriverSubmitDcb went quiet (t={ElapsedSecondsSinceBoot():F1}s, " +
+			$"{secondsSinceLastSubmit:F1}s since last submit, {count} total submits ever) — " +
+			"full snapshot at the freeze moment ---");
+		LogFlipStallSnapshot(secondsSinceLastSubmit);
+	}
+
+	private void LogFlipStallSnapshot(double stalledSeconds)
+	{
+		try
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] --- flip stall snapshot (last_flip_version={FlipProgressTracker.LastFlipVersion} " +
+				$"stalled_for={stalledSeconds:F1}s) ---");
+
+			var (heartbeatCount, secondsSinceHeartbeat) = AgcExports.GpuWaitMonitorHeartbeat();
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall gpu_wait_monitor: iterations={heartbeatCount} " +
+				$"seconds_since_last_iteration={secondsSinceHeartbeat:F1}");
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall orphan_preamble_state: {AgcExports.DumpOrphanPreambleState()}");
+			LogGuestThreadGateOwner();
+			LogMainThreadFlipStallSnapshot();
+			LogGpuWaitRegistrySnapshot();
+			LogFlipStallGuestThreads();
+			Console.Error.Flush();
+		}
+		catch
+		{
+		}
+	}
+
+
+	// The process's original entry thread (RunGuestEntryStub) never goes
+	// through TryStartThread, so it has no GuestThreadState and is invisible
+	// to LogFlipStallGuestThreads below — a real gap, since on most titles
+	// this IS the thread that builds the per-frame graphics DCB and posts
+	// the job-worker semaphores every JobWorkerN in that dump is waiting on.
+	// _cpuContext already gives live access to its registers (see
+	// LogStallWatchdogSnapshot above, which reads the same field) — no
+	// suspend/resume dance needed here, unlike the per-guest-thread capture.
+	private void LogMainThreadFlipStallSnapshot()
+	{
+		var cpuContext = _cpuContext;
+		if (cpuContext is null)
+		{
+			return;
+		}
+
+		LogMainThreadOsLiveness();
+
+		var rip = cpuContext.Rip;
+		var progressed = _flipStallPrevMainRip == 0 || rip != _flipStallPrevMainRip;
+		_flipStallPrevMainRip = rip;
+
+		var stubText = string.Empty;
+		var alignedRip = rip & 0xFFFFFFFFFFFFFFF0uL;
+		for (var i = 0; i < _importEntries.Length; i++)
+		{
+			if (_importEntries[i].Address != alignedRip)
+			{
+				continue;
+			}
+
+			var nid = _importEntries[i].Nid;
+			stubText = _moduleManager.TryGetExport(nid, out var export)
+				? $" import={nid}({export.LibraryName}:{export.Name})"
+				: $" import={nid}";
+			break;
+		}
+
+		Console.Error.WriteLine(
+			$"[LOADER][ERROR] Stall main-thread: rip=0x{rip:X16} progressed={progressed}{stubText}");
+	}
+
+	// _cpuContext is a managed mirror whose Rip is only refreshed at import
+	// boundaries — it says nothing about whether the underlying OS thread
+	// still exists, and reads stale if that thread died between imports. This
+	// asks the kernel directly: does the entry thread's OS tid still resolve,
+	// is it still running (STILL_ACTIVE), and what RIP is it really at.
+	private void LogMainThreadOsLiveness()
+	{
+		var hostThreadId = Volatile.Read(ref _mainEntryHostThreadId);
+		if (hostThreadId == 0 || !OperatingSystem.IsWindows())
+		{
+			return;
+		}
+
+		var threadHandle = OpenThread(
+			ThreadGetContext | ThreadSuspendResume | ThreadQueryLimitedInformation,
+			false,
+			unchecked((uint)hostThreadId));
+		if (threadHandle == 0)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall main-thread-os: tid={hostThreadId} alive=NO (OpenThread failed, " +
+				$"error={Marshal.GetLastWin32Error()} — the OS thread no longer exists)");
+			return;
+		}
+
+		try
+		{
+			var exitText = "exit_code=unavailable";
+			var alive = true;
+			if (GetExitCodeThread(threadHandle, out var exitCode))
+			{
+				alive = exitCode == StillActiveExitCode;
+				exitText = alive ? "running" : $"EXITED exit_code=0x{exitCode:X8}";
+			}
+
+			var liveRipText = string.Empty;
+			if (alive && TryCaptureHostThreadContext(hostThreadId, out var hostContext))
+			{
+				liveRipText = $" live_rip=0x{hostContext.Rip:X16} live_rsp=0x{hostContext.Rsp:X16}";
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall main-thread-os: tid={hostThreadId} alive={(alive ? "yes" : "NO")} " +
+				$"{exitText}{liveRipText}");
+		}
+		finally
+		{
+			_ = CloseHandle(threadHandle);
+		}
+	}
+
+	private void LogGpuWaitRegistrySnapshot()
+	{
+		List<GpuWaitRegistry.WaitingDcb> waiters;
+		try
+		{
+			waiters = GpuWaitRegistry.SnapshotAll();
+		}
+		catch
+		{
+			return;
+		}
+
+		if (waiters.Count == 0)
+		{
+			Console.Error.WriteLine("[LOADER][ERROR] Stall gpu-waits: none registered");
+			return;
+		}
+
+		var nowTicks = Stopwatch.GetTimestamp();
+		var logged = 0;
+		foreach (var waiter in waiters)
+		{
+			var ageSeconds = (nowTicks - waiter.RegisteredTicks) / (double)Stopwatch.Frequency;
+			// The live label value turns the static waiter list into a causal
+			// chain: whichever stuck waiter's label is exactly one short of
+			// its reference is waiting on a producer that never ran; a label
+			// already at/past its reference means the waiter itself was never
+			// re-polled (a different bug). Suite 24's snapshots lacked this
+			// and left the chain's head ambiguous.
+			var curText = TryReadGuestMemoryDirect(waiter.WaitAddress, out var liveValue)
+				? $" cur=0x{liveValue:X}"
+				: " cur=<unreadable>";
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall gpu-wait: addr=0x{waiter.WaitAddress:X16} ref=0x{waiter.ReferenceValue:X16} " +
+				$"mask=0x{waiter.Mask:X16} func={waiter.CompareFunction} queue={waiter.QueueName ?? "?"} " +
+				$"cb=0x{waiter.CommandBufferAddress:X16} age={ageSeconds:F1}s{curText}");
+			LogOrphanProducerScan(waiter.WaitAddress);
+			if (AgcExports.TryFindRingProducer(waiter.CommandBufferAddress, out var producerThread, out var secondsSinceWrite))
+			{
+				var pcText = string.Empty;
+				GuestThreadState? producerState;
+				using (LockGate("LogGpuWaitRegistrySnapshot"))
+				{
+					_guestThreads.TryGetValue(producerThread, out producerState);
+				}
+
+				if (producerState is not null &&
+					TryCaptureHostThreadContext(Volatile.Read(ref producerState.HostThreadId), out var hostContext))
+				{
+					pcText = $" host_rip=0x{hostContext.Rip:X16}";
+				}
+
+				Console.Error.WriteLine(
+					$"[LOADER][ERROR] Stall ring-producer: cb=0x{waiter.CommandBufferAddress:X16} " +
+					$"thread=0x{producerThread:X16} last_write_age={secondsSinceWrite:F1}s{pcText} " +
+					"(see matching Stall guest-thread line for its current state)");
+			}
+			logged++;
+			if (logged >= 32 && waiters.Count > logged)
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall gpu-wait: ... {waiters.Count - logged} more");
+				break;
+			}
+		}
+	}
+
+	// For one stuck wait label, find the packet that would satisfy it: scan
+	// every tracked builder arena for a qword equal to the label address. A
+	// write_data/release_mem packet stores its destination at packet+8, so a
+	// hit at ARENA+N means a candidate packet at ARENA+N-8; where that offset
+	// sits relative to the arena's cursor says whether the producer was built
+	// and left unsubmitted (offset >= cursor: the cursor-tracking gap), built
+	// and submitted but never executed (offset < cursor: it is parked behind
+	// a WAIT_REG_MEM upstream in the same DCB — the cascade case), or never
+	// built at all (no hit anywhere).
+	private void LogOrphanProducerScan(ulong waitAddress)
+	{
+		try
+		{
+			foreach (var (header, arenaBase, cursor) in AgcExports.SnapshotBuilderArenas())
+			{
+				if (arenaBase == 0)
+				{
+					continue;
+				}
+
+				var scanEnd = arenaBase + 0x10000;
+				for (var addr = arenaBase; addr + 8 <= scanEnd; addr += 4)
+				{
+					if (!TryReadGuestMemoryDirect(addr, out var value))
+					{
+						break; // arena chunk unmapped past here — stop this arena
+					}
+
+					if (value != waitAddress || addr < arenaBase + 8)
+					{
+						continue;
+					}
+
+					var packet = addr - 8;
+					_ = TryReadGuestMemoryDirect(packet, out var headerAndControl);
+					_ = TryReadGuestMemoryDirect(packet + 16, out var payload);
+					Console.Error.WriteLine(
+						$"[LOADER][ERROR] Stall producer-scan: label=0x{waitAddress:X} " +
+						$"packet=0x{packet:X} arena_header=0x{header:X} arena=0x{arenaBase:X} " +
+						$"cursor=0x{cursor:X} beyond_cursor={packet >= cursor} " +
+						$"hdr_ctl=0x{headerAndControl:X16} payload=0x{payload:X16}");
+				}
+			}
+		}
+		catch
+		{
+		}
+	}
+
+	// Every live guest thread except Exited/Faulted (those are done, not part
+	// of a stall), each annotated with whether its import count moved since
+	// the previous flip-stall snapshot — the one piece of information a
+	// single point-in-time dump cannot give: is this thread actually making
+	// progress, or has it been sitting at the same instruction the whole
+	// interval.
+	private void LogFlipStallGuestThreads()
+	{
+		var threads = SnapshotGuestThreads();
+		var seenHandles = new HashSet<ulong>(threads.Length);
+		var logged = 0;
+		foreach (var thread in threads)
+		{
+			seenHandles.Add(thread.ThreadHandle);
+			if (thread.State is GuestThreadRunState.Exited or GuestThreadRunState.Faulted)
+			{
+				continue;
+			}
+
+			var imports = Interlocked.Read(ref thread.ImportCount);
+			var progressed = !_flipStallPrevImportCounts.TryGetValue(thread.ThreadHandle, out var prevImports) ||
+				imports != prevImports;
+			_flipStallPrevImportCounts[thread.ThreadHandle] = imports;
+
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] Stall guest-thread: handle=0x{thread.ThreadHandle:X16} name='{thread.Name}' " +
+				$"state={thread.State} imports={imports} progressed={progressed} " +
+				$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
+				$"block={thread.BlockReason ?? "none"}");
+			logged++;
+			if (logged >= 40 && threads.Length > logged)
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall guest-thread: ... {threads.Length - logged} more");
+				break;
+			}
+		}
+
+		if (_flipStallPrevImportCounts.Count <= seenHandles.Count)
+		{
+			return;
+		}
+
+		foreach (var staleHandle in _flipStallPrevImportCounts.Keys.Where(h => !seenHandles.Contains(h)).ToList())
+		{
+			_flipStallPrevImportCounts.Remove(staleHandle);
+		}
+	}
+
 	private unsafe static bool TryCaptureHostThreadContext(int hostThreadId, out HostThreadContextSnapshot snapshot)
 	{
 		snapshot = default;
@@ -6117,6 +6612,24 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	private unsafe static bool TryReadGuestMemoryDirect(ulong address, out ulong value)
+	{
+		value = 0;
+		if (address == 0)
+		{
+			return false;
+		}
+
+		try
+		{
+			value = *(ulong*)address;
+			return true;
+		}
+		catch
+		{
+			return false;
+		}
+	}
 
 	private static uint TlsAlloc() =>
 		OperatingSystem.IsWindows() ? Win32TlsAlloc() : PosixHostStubs.TlsAlloc();
@@ -6162,6 +6675,17 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private static bool CloseHandle(nint hObject) =>
 		OperatingSystem.IsWindows() && Win32CloseHandle(hObject);
+
+	private static bool GetExitCodeThread(nint hThread, out uint exitCode)
+	{
+		if (OperatingSystem.IsWindows())
+		{
+			return Win32GetExitCodeThread(hThread, out exitCode);
+		}
+
+		exitCode = 0;
+		return false;
+	}
 
 	[DllImport("kernel32.dll", EntryPoint = "TlsAlloc")]
 	private static extern uint Win32TlsAlloc();
@@ -6212,9 +6736,20 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	[return: MarshalAs(UnmanagedType.Bool)]
 	private unsafe static extern bool Win32GetThreadContext(nint hThread, void* lpContext);
 
+	[DllImport("kernel32.dll", EntryPoint = "SetThreadContext", SetLastError = true)]
+	[return: MarshalAs(UnmanagedType.Bool)]
+	private unsafe static extern bool Win32SetThreadContext(nint hThread, void* lpContext);
+
+	private unsafe static bool SetThreadContext(nint hThread, void* lpContext) =>
+		OperatingSystem.IsWindows() && Win32SetThreadContext(hThread, lpContext);
+
 	[DllImport("kernel32.dll", EntryPoint = "CloseHandle", SetLastError = true)]
 	[return: MarshalAs(UnmanagedType.Bool)]
 	private static extern bool Win32CloseHandle(nint hObject);
+
+	[DllImport("kernel32.dll", EntryPoint = "GetExitCodeThread", SetLastError = true)]
+	[return: MarshalAs(UnmanagedType.Bool)]
+	private static extern bool Win32GetExitCodeThread(nint hThread, out uint lpExitCode);
 
 	/// <summary>
 	/// Set when <see cref="Dispose"/> intentionally left the native session
