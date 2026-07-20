@@ -3242,14 +3242,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				_readyGuestThreads.Enqueue(thread);
 				Interlocked.Increment(ref _readyGuestThreadCount);
 				wakeCount++;
-				Console.Error.WriteLine(
-					$"[LOADER][WARN] cooperative_block_resumed thread=0x{thread.ThreadHandle:X16} name='{thread.Name}' wake_key={wakeKey}");
 			}
-		}
-
-		if (wakeCount == 0)
-		{
-			Console.Error.WriteLine($"[LOADER][WARN] cooperative_block_wake_no_match wake_key={wakeKey}");
 		}
 
 		if (wakeCount != 0)
